@@ -32,31 +32,10 @@ roslaunch multi_robot_sim dual_turtlebot3_slam+rviz.launch
 
 roslaunch multi_robot_sim map_fusion.launch
 
-roslaunch multi_robot_sim frontier_exploration.launch
+rosrun multi_robot_sim coverage_space+free_space.py
 
-rosrun multi_robot_sim frontier_evaluation_node.py
+rosrun multi_robot_sim region_allocator.py
 
-rosrun multi_robot_sim task_allocation_node.py
-
-rosrun multi_robot_sim astar_planner_node.py
-
-rosrun multi_robot_sim dwa_local_planner_node.py
-
-rosrun multi_robot_sim final_path_controller.py
-
-rosrun multi_robot_sim multi_robot_keyboard.py
-
-
-
-rosrun multi_robot_sim frontier_detector.py
-
-rosrun multi_robot_sim frontier_cluster_node.py
-
-rosrun multi_robot_sim robot_frontier_cost_node.py
-
-rosrun multi_robot_sim frontier_evaluation_node.py
-
-rosrun multi_robot_sim task_allocation_node.py
 
 rosrun tf view_frames（查看tf）
 
