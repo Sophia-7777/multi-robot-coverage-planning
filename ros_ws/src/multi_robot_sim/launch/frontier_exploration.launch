@@ -1,0 +1,67 @@
+<launch>
+
+    <!-- ========================================================= -->
+    <!-- Frontier Detector -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="frontier_detector.py"
+        name="frontier_detector"
+        output="screen"
+        respawn="false"
+    />
+
+
+    <!-- ========================================================= -->
+    <!-- Frontier Cluster -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="frontier_cluster_node.py"
+        name="frontier_cluster"
+        output="screen"
+        respawn="false"
+    />
+
+
+    <!-- ========================================================= -->
+    <!-- Robot Frontier Cost -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="robot_frontier_cost_node.py"
+        name="robot_frontier_cost"
+        output="screen"
+        respawn="false"
+    />
+
+
+    <!-- ========================================================= -->
+    <!-- Frontier Evaluation -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="frontier_evaluation_node.py"
+        name="frontier_evaluation_node"
+        output="screen"
+        respawn="false"
+    />
+
+
+    <!-- ========================================================= -->
+    <!-- Task Allocation -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="task_allocation_node.py"
+        name="task_allocation_node"
+        output="screen"
+        respawn="false"
+    />
+
+</launch>

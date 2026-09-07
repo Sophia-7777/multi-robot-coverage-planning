@@ -1,0 +1,75 @@
+<launch>
+
+    <!-- ========================================================= -->
+    <!-- A* Global Planner -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="astar_planner_node.py"
+        name="astar_planner"
+        output="screen">
+
+        <param name="global_frame" value="global_map"/>
+        <param name="map_topic" value="/global_map"/>
+
+        <rosparam param="robots">
+            [robot1, robot2]
+        </rosparam>
+
+        <rosparam param="base_frames">
+            [robot1/base_footprint,
+             robot2/base_footprint]
+        </rosparam>
+
+    </node>
+
+
+    <!-- ========================================================= -->
+    <!-- DWA Local Planner -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="dwa_local_planner.py"
+        name="dwa_local_planner"
+        output="screen">
+
+        <param name="global_frame" value="global_map"/>
+
+        <rosparam param="robots">
+            [robot1, robot2]
+        </rosparam>
+
+        <rosparam param="base_frames">
+            [robot1/base_footprint,
+             robot2/base_footprint]
+        </rosparam>
+
+    </node>
+
+
+    <!-- ========================================================= -->
+    <!-- Final Path Controller -->
+    <!-- ========================================================= -->
+
+    <node
+        pkg="multi_robot_sim"
+        type="final_path_controller.py"
+        name="final_path_controller"
+        output="screen">
+
+        <param name="global_frame" value="global_map"/>
+
+        <rosparam param="robots">
+            [robot1, robot2]
+        </rosparam>
+
+        <rosparam param="base_frames">
+            [robot1/base_footprint,
+             robot2/base_footprint]
+        </rosparam>
+
+    </node>
+
+</launch>

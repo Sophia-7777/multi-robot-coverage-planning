@@ -1,0 +1,47 @@
+<launch>
+
+    <node
+        pkg="multi_robot_sim"
+        type="map_fusion_node.py"
+        name="realtime_map_fusion_node"
+        output="screen">
+
+        <param name="robot1_name" value="robot1"/>
+        <param name="robot2_name" value="robot2"/>
+
+        <param name="robot1_map_frame"
+               value="robot1/map"/>
+
+        <param name="robot2_map_frame"
+               value="robot2/map"/>
+
+        <param name="robot1_base_frame"
+               value="robot1/base_footprint"/>
+
+        <param name="robot2_base_frame"
+               value="robot2/base_footprint"/>
+
+        <param name="global_frame"
+               value="global_map"/>
+
+        <param name="map_topic_1"
+               value="/robot1/map"/>
+
+        <param name="map_topic_2"
+               value="/robot2/map"/>
+
+        <param name="output_topic"
+               value="/global_map"/>
+
+        <param name="publish_rate"
+               value="2.0"/>
+
+        <param name="occupied_threshold"
+               value="65"/>
+
+        <param name="free_threshold"
+               value="25"/>
+
+    </node>
+
+</launch>

@@ -1,0 +1,99 @@
+<launch>
+
+  <arg name="model" default="burger"/>
+
+  <!-- ================================================= -->
+  <!-- Gazebo -->
+  <!-- ================================================= -->
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+
+    <arg name="world_name"
+         value="$(find multi_robot_sim)/worlds/multi_robot.world"/>
+
+    <arg name="paused" value="false"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="gui" value="true"/>
+    <arg name="headless" value="false"/>
+    <arg name="debug" value="false"/>
+
+  </include>
+
+
+  <!-- ================================================= -->
+  <!-- Robot 1 -->
+  <!-- ================================================= -->
+
+  <group ns="robot1">
+
+    <!-- TF prefix -->
+    <param name="tf_prefix" value="robot1"/>
+
+    <!-- Robot description -->
+    <param name="robot_description"
+           command="$(find xacro)/xacro --inorder
+           $(find turtlebot3_description)/urdf/turtlebot3_$(arg model).urdf.xacro
+           robot_namespace:=robot1"/>
+
+    <!-- Spawn -->
+    <node pkg="gazebo_ros"
+          type="spawn_model"
+          name="spawn"
+          args="-urdf
+                -param robot_description
+                -model robot1
+                -x 0.0
+                -y 0.0
+                -z 0.01"/>
+
+    <!-- Robot state publisher -->
+    <node pkg="robot_state_publisher"
+          type="robot_state_publisher"
+          name="robot_state_publisher">
+
+      <param name="tf_prefix" value="robot1"/>
+
+    </node>
+
+  </group>
+
+
+  <!-- ================================================= -->
+  <!-- Robot 2 -->
+  <!-- ================================================= -->
+
+  <group ns="robot2">
+
+    <!-- TF prefix -->
+    <param name="tf_prefix" value="robot2"/>
+
+    <!-- Robot description -->
+    <param name="robot_description"
+           command="$(find xacro)/xacro --inorder
+           $(find turtlebot3_description)/urdf/turtlebot3_$(arg model).urdf.xacro
+           robot_namespace:=robot2"/>
+
+    <!-- Spawn -->
+    <node pkg="gazebo_ros"
+          type="spawn_model"
+          name="spawn"
+          args="-urdf
+                -param robot_description
+                -model robot2
+                -x 2.0
+                -y 0.0
+                -z 0.01"/>
+
+    <!-- Robot state publisher -->
+    <node pkg="robot_state_publisher"
+          type="robot_state_publisher"
+          name="robot_state_publisher">
+
+      <param name="tf_prefix" value="robot2"/>
+
+    </node>
+
+  </group>
+
+
+</launch>
