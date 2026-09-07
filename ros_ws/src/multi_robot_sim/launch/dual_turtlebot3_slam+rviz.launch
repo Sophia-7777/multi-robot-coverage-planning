@@ -43,10 +43,10 @@
       <param name="stt" value="0.02"/>
 
       <!-- Map bounds -->
-      <param name="xmin" value="-10.0"/>
-      <param name="ymin" value="-10.0"/>
-      <param name="xmax" value="10.0"/>
-      <param name="ymax" value="10.0"/>
+      <param name="xmin" value="-20.0"/>
+      <param name="ymin" value="-20.0"/>
+      <param name="xmax" value="20.0"/>
+      <param name="ymax" value="20.0"/>
 
     </node>
 
@@ -94,10 +94,10 @@
       <param name="stt" value="0.02"/>
 
       <!-- Map bounds -->
-      <param name="xmin" value="-10.0"/>
-      <param name="ymin" value="-10.0"/>
-      <param name="xmax" value="10.0"/>
-      <param name="ymax" value="10.0"/>
+      <param name="xmin" value="-20.0"/>
+      <param name="ymin" value="-20.0"/>
+      <param name="xmax" value="20.0"/>
+      <param name="ymax" value="20.0"/>
 
     </node>
 

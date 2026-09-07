@@ -35,7 +35,7 @@ class RegionAllocator:
         # Initial region allocation is performed only once.
         # ------------------------------------------------------------
         self.reallocate_on_robot_move = rospy.get_param("~reallocate_on_robot_move",True)
-        self.min_robot_move = rospy.get_param("~min_robot_move",2.0)
+        self.min_robot_move = rospy.get_param("~min_robot_move",0.5)
         # ============================================================
         # Data
         # ============================================================

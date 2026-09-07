@@ -177,7 +177,7 @@ class CoveragePathPlanner:
 
         self.coverage_spacing = rospy.get_param(
             "~coverage_spacing",
-            0.25
+            0.60
         )
 
         self.min_cell_size = rospy.get_param(
