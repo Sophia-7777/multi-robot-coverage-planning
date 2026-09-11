@@ -34,7 +34,7 @@ Robot1:
 Robot2:
 
     /robot2_coverage_path
-            |
+            |z
             v
     Global BCD Coverage Path
             |
