@@ -5,152 +5,20 @@
 coverage_path_controller.py
 
 ROS1 Dual Robot Coverage Path Controller
-Global Coverage Path + DWA Local Planner
+Global BCD Coverage Path + Improved DWA Local Planner
 
-======================================================================
-系统结构
-======================================================================
+主要改进：
 
-Robot1:
-
-    /robot1_coverage_path
-            |
-            v
-    Global BCD Coverage Path
-            |
-            v
-      Lookahead Target
-            |
-            v
-           DWA
-       ↙    ↓     ↘
-    Laser  Path   Robot2
-       ↘    ↓     ↙
-            |
-            v
-    /robot1/cmd_vel
-
-
-Robot2:
-
-    /robot2_coverage_path
-            |z
-            v
-    Global BCD Coverage Path
-            |
-            v
-      Lookahead Target
-            |
-            v
-           DWA
-       ↙    ↓     ↘
-    Laser  Path   Robot1
-       ↘    ↓     ↙
-            |
-            v
-    /robot2/cmd_vel
-
-
-======================================================================
-输入
-======================================================================
-
-    /robot1_coverage_path
-    /robot2_coverage_path
-
-    /gazebo/model_states
-
-    /robot1/scan
-    /robot2/scan
-
-
-======================================================================
-输出
-======================================================================
-
-    /robot1/cmd_vel
-    /robot2/cmd_vel
-
-
-======================================================================
-DWA 结构
-======================================================================
-
-Global Coverage Path
-        |
-        v
-Lookahead Target
-        |
-        v
-Dynamic Window
-        |
-        +----------------------+
-        |                      |
-        v                      v
-    LaserScan             Other Robot
-        |                      |
-        +----------+-----------+
-                   |
-                   v
-             Collision Check
-                   |
-                   v
-             Trajectory Score
-                   |
-        +----------+----------+
-        |          |          |
-        v          v          v
-      Path      Heading     Speed
-        |
-        +----------+----------+
-                   |
-                   v
-             Best (v, omega)
-                   |
-                   v
-                cmd_vel
-
-
-======================================================================
-重要说明
-======================================================================
-
-1. coverage_radius 和 robot_radius 是两个不同概念。
-
-   coverage_radius:
-       传感器/覆盖区域半径。
-
-   robot_radius:
-       机器人实际碰撞半径。
-
-2. 如果 coverage_radius = 0.5 m：
-
-       不代表 robot_radius = 0.5 m。
-
-3. DWA 的碰撞判断使用：
-
-       robot_radius + obstacle_margin
-
-4. 本程序默认：
-
-       /robotX/scan
-
-   的 LaserScan 坐标系与机器人 base_link 坐标系一致。
-
-   如果你的 laser 相对于 base_link 存在明显的 TF 偏移，
-   应进一步使用 TF 进行坐标转换。
-
-5. DWA 不负责重新规划 BCD Cell。
-
-   coverage_path.py:
-       BCD + A* + Zig-Zag
-       负责全局覆盖路径。
-
-   coverage_path_controller.py:
-       DWA
-       负责局部速度和避障。
-
-======================================================================
+1. 更精确的 Global Path Tracking
+2. 使用整个预测轨迹计算 Path Error
+3. 使用 Path Heading
+4. 使用 Path Progress
+5. 增加原地旋转 Recovery
+6. no safe trajectory 不再永久 STOP
+7. DWA 支持 0 m/s + 非零角速度
+8. 静态障碍物与其他机器人分别处理
+9. 更合理的 obstacle clearance
+10. 自动从障碍物状态恢复
 """
 
 import math
@@ -163,6 +31,10 @@ from geometry_msgs.msg import Twist
 from gazebo_msgs.msg import ModelStates
 from sensor_msgs.msg import LaserScan
 
+
+# =====================================================================
+# Robot Path Tracker
+# =====================================================================
 
 class RobotPathTracker:
 
@@ -182,7 +54,7 @@ class RobotPathTracker:
         self.other_robot_name = other_robot_name
 
         # ============================================================
-        # Basic Parameters
+        # Control
         # ============================================================
 
         self.control_frequency = rospy.get_param(
@@ -191,7 +63,7 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # Robot Velocity
+        # Velocity
         # ============================================================
 
         self.max_linear_speed = rospy.get_param(
@@ -210,94 +82,61 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # DWA Acceleration
+        # Acceleration
         # ============================================================
-
-        # ------------------------------------------------------------
-        # 注意：
-        #
-        # Dynamic Window 的速度变化应该使用控制周期：
-        #
-        #     control_dt = 1 / control_frequency
-        #
-        # 而不是 dwa_dt。
-        # ------------------------------------------------------------
 
         self.max_linear_accel = rospy.get_param(
             "~max_linear_accel",
-            1.0
+            1.5
         )
 
         self.max_angular_accel = rospy.get_param(
             "~max_angular_accel",
-            2.5
+            3.5
         )
 
         # ============================================================
-        # DWA Prediction
+        # DWA prediction
         # ============================================================
 
         self.dwa_dt = rospy.get_param(
             "~dwa_dt",
-            0.10
+            0.08
         )
 
         self.dwa_predict_time = rospy.get_param(
             "~dwa_predict_time",
-            1.2
+            1.5
         )
 
         self.linear_samples = rospy.get_param(
             "~linear_samples",
-            7
+            9
         )
 
         self.angular_samples = rospy.get_param(
             "~angular_samples",
-            15
+            21
         )
 
         # ============================================================
-        # Robot Geometry
+        # Robot geometry
         # ============================================================
-
-        # ------------------------------------------------------------
-        # 覆盖半径
-        #
-        # 例如：
-        #
-        #     coverage_radius = 0.5 m
-        #
-        # 这里只是任务参数。
-        # DWA 不直接把它作为机器人碰撞半径。
-        # ------------------------------------------------------------
 
         self.coverage_radius = rospy.get_param(
             "~coverage_radius",
             0.5
         )
 
-        # ------------------------------------------------------------
-        # 机器人实际碰撞半径
-        # ------------------------------------------------------------
-
         self.robot_radius = rospy.get_param(
             "~robot_radius",
             0.25
         )
 
-        # ------------------------------------------------------------
-        # 静态障碍物安全裕量
-        # ------------------------------------------------------------
-
         self.obstacle_margin = rospy.get_param(
             "~obstacle_margin",
-            0.10
+            0.08
         )
-
-        # ------------------------------------------------------------
-        # 两机器人额外安全距离
-        # ------------------------------------------------------------
 
         self.robot_collision_margin = rospy.get_param(
             "~robot_collision_margin",
@@ -305,7 +144,7 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # LaserScan
+        # Laser
         # ============================================================
 
         self.scan_timeout = rospy.get_param(
@@ -314,17 +153,17 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # Global Path
+        # Global path
         # ============================================================
 
         self.lookahead_distance = rospy.get_param(
             "~lookahead_distance",
-            0.45
+            0.40
         )
 
         self.waypoint_tolerance = rospy.get_param(
             "~waypoint_tolerance",
-            0.12
+            0.10
         )
 
         self.goal_tolerance = rospy.get_param(
@@ -338,68 +177,84 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # DWA Score Weights
+        # Path tracking
         # ============================================================
 
-        # 路径贴合
+        self.path_search_forward = rospy.get_param(
+            "~path_search_forward",
+            100
+        )
+
+        self.path_error_scale = rospy.get_param(
+            "~path_error_scale",
+            0.35
+        )
+
+        # ============================================================
+        # DWA weights
+        # ============================================================
+
         self.path_weight = rospy.get_param(
             "~path_weight",
-            1.5
+            3.0
         )
 
-        # 朝向
         self.heading_weight = rospy.get_param(
             "~heading_weight",
+            2.5
+        )
+
+        self.progress_weight = rospy.get_param(
+            "~progress_weight",
+            3.0
+        )
+
+        self.velocity_weight = rospy.get_param(
+            "~velocity_weight",
             1.0
         )
 
-        # 速度
-        self.velocity_weight = rospy.get_param(
-            "~velocity_weight",
+        self.obstacle_weight = rospy.get_param(
+            "~obstacle_weight",
             1.5
         )
 
-        # 静态障碍物
-        self.obstacle_weight = rospy.get_param(
-            "~obstacle_weight",
-            1.0
-        )
-
-        # 另一台机器人
         self.robot_weight = rospy.get_param(
             "~robot_weight",
-            2.0
+            3.0
         )
 
-        # 沿全局路径前进
-        self.progress_weight = rospy.get_param(
-            "~progress_weight",
-            2.0
-        )
-
-        # 角速度惩罚
         self.angular_penalty_weight = rospy.get_param(
             "~angular_penalty_weight",
-            0.2
+            0.15
         )
 
         # ============================================================
-        # Obstacle Clearance
+        # Obstacle clearance
         # ============================================================
-
-        # ------------------------------------------------------------
-        # 超过这个距离以后，不再额外奖励“离障碍物更远”。
-        #
-        # 这样可以避免：
-        #
-        #     障碍物距离 2m
-        #
-        # 时 DWA 仍然为了获得 clearance score 而降低速度。
-        # ------------------------------------------------------------
 
         self.preferred_obstacle_distance = rospy.get_param(
             "~preferred_obstacle_distance",
-            0.80
+            0.70
+        )
+
+        # ============================================================
+        # Recovery
+        # ============================================================
+
+        self.recovery_rotate_speed = rospy.get_param(
+            "~recovery_rotate_speed",
+            0.60
+        )
+
+        self.recovery_timeout = rospy.get_param(
+            "~recovery_timeout",
+            3.0
+        )
+
+        self.recovery_min_rotation = rospy.get_param(
+            "~recovery_min_rotation",
+            0.15
         )
 
         # ============================================================
@@ -407,12 +262,7 @@ class RobotPathTracker:
         # ============================================================
 
         self.path = None
-
         self.path_points = []
-
-        # ------------------------------------------------------------
-        # Current robot
-        # ------------------------------------------------------------
 
         self.robot_x = None
         self.robot_y = None
@@ -421,20 +271,12 @@ class RobotPathTracker:
         self.robot_v = 0.0
         self.robot_w = 0.0
 
-        # ------------------------------------------------------------
-        # Other robot
-        # ------------------------------------------------------------
-
         self.other_robot_x = None
         self.other_robot_y = None
         self.other_robot_yaw = None
 
         self.other_robot_v = 0.0
         self.other_robot_w = 0.0
-
-        # ------------------------------------------------------------
-        # LaserScan
-        # ------------------------------------------------------------
 
         self.scan_msg = None
 
@@ -458,6 +300,15 @@ class RobotPathTracker:
         self.finished = False
 
         self.last_path_time = None
+
+        # ============================================================
+        # Recovery state
+        # ============================================================
+
+        self.recovery_mode = False
+        self.recovery_start_time = None
+        self.recovery_direction = 1.0
+        self.recovery_start_yaw = None
 
         # ============================================================
         # Publisher
@@ -494,82 +345,38 @@ class RobotPathTracker:
             queue_size=1
         )
 
-        # ============================================================
-        # Log
-        # ============================================================
-
         rospy.loginfo(
             "=========================================="
         )
 
         rospy.loginfo(
-            "Robot%d DWA Controller initialized.",
+            "Robot%d Improved DWA Controller",
             self.robot_id
         )
 
         rospy.loginfo(
-            "Robot name: %s",
+            "Robot: %s",
             self.robot_name
         )
 
         rospy.loginfo(
-            "Other robot: %s",
+            "Other: %s",
             self.other_robot_name
         )
 
         rospy.loginfo(
-            "Coverage radius: %.3f m",
-            self.coverage_radius
-        )
-
-        rospy.loginfo(
-            "Robot radius: %.3f m",
+            "Robot radius: %.2f",
             self.robot_radius
         )
 
         rospy.loginfo(
-            "Obstacle margin: %.3f m",
-            self.obstacle_margin
-        )
-
-        rospy.loginfo(
-            "Max linear speed: %.3f m/s",
+            "Max speed: %.2f",
             self.max_linear_speed
         )
 
         rospy.loginfo(
-            "Max angular speed: %.3f rad/s",
-            self.max_angular_speed
-        )
-
-        rospy.loginfo(
-            "Max linear acceleration: %.3f m/s^2",
-            self.max_linear_accel
-        )
-
-        rospy.loginfo(
-            "DWA dt: %.3f s",
-            self.dwa_dt
-        )
-
-        rospy.loginfo(
-            "DWA prediction: %.2f s",
-            self.dwa_predict_time
-        )
-
-        rospy.loginfo(
-            "Velocity weight: %.2f",
-            self.velocity_weight
-        )
-
-        rospy.loginfo(
-            "Progress weight: %.2f",
-            self.progress_weight
-        )
-
-        rospy.loginfo(
-            "Preferred obstacle distance: %.2f m",
-            self.preferred_obstacle_distance
+            "Lookahead: %.2f",
+            self.lookahead_distance
         )
 
         rospy.loginfo(
@@ -585,11 +392,10 @@ class RobotPathTracker:
         if len(msg.poses) == 0:
 
             rospy.logwarn(
-                "Robot%d received empty Path.",
+                "Robot%d received empty path.",
                 self.robot_id
             )
 
-            self.path = None
             self.path_points = []
             self.path_received = False
 
@@ -603,11 +409,11 @@ class RobotPathTracker:
 
         for pose in msg.poses:
 
-            x = pose.pose.position.x
-            y = pose.pose.position.y
-
             self.path_points.append(
-                (x, y)
+                (
+                    pose.pose.position.x,
+                    pose.pose.position.y
+                )
             )
 
         self.path_received = True
@@ -619,20 +425,16 @@ class RobotPathTracker:
         self.last_path_time = rospy.Time.now()
 
         rospy.loginfo(
-            "Robot%d received new Path: %d points.",
+            "Robot%d received path: %d points.",
             self.robot_id,
             len(self.path_points)
         )
 
     # =================================================================
-    # Gazebo Model States
+    # Model states
     # =================================================================
 
     def model_states_callback(self, msg):
-
-        # ============================================================
-        # Current Robot
-        # ============================================================
 
         if self.robot_name in msg.name:
 
@@ -645,100 +447,61 @@ class RobotPathTracker:
             self.robot_x = pose.position.x
             self.robot_y = pose.position.y
 
-            qx = pose.orientation.x
-            qy = pose.orientation.y
-            qz = pose.orientation.z
-            qw = pose.orientation.w
-
-            self.robot_yaw = self.quaternion_to_yaw(
-                qx,
-                qy,
-                qz,
-                qw
+            self.robot_yaw = (
+                self.quaternion_to_yaw(
+                    pose.orientation.x,
+                    pose.orientation.y,
+                    pose.orientation.z,
+                    pose.orientation.w
+                )
             )
-
-            # --------------------------------------------------------
-            # Gazebo velocity
-            # --------------------------------------------------------
 
             if index < len(msg.twist):
 
-                self.robot_v = msg.twist[
-                    index
-                ].linear.x
+                self.robot_v = max(
+                    0.0,
+                    msg.twist[index].linear.x
+                )
 
-                self.robot_w = msg.twist[
-                    index
-                ].angular.z
-
-            # --------------------------------------------------------
-            # DWA 不允许负向前速度
-            # --------------------------------------------------------
-
-            self.robot_v = max(
-                0.0,
-                self.robot_v
-            )
+                self.robot_w = (
+                    msg.twist[index].angular.z
+                )
 
             self.pose_received = True
 
-        # ============================================================
-        # Other Robot
-        # ============================================================
-
         if self.other_robot_name in msg.name:
 
-            other_index = msg.name.index(
+            index = msg.name.index(
                 self.other_robot_name
             )
 
-            other_pose = msg.pose[
-                other_index
-            ]
+            pose = msg.pose[index]
 
-            self.other_robot_x = (
-                other_pose.position.x
-            )
-
-            self.other_robot_y = (
-                other_pose.position.y
-            )
-
-            qx = other_pose.orientation.x
-            qy = other_pose.orientation.y
-            qz = other_pose.orientation.z
-            qw = other_pose.orientation.w
+            self.other_robot_x = pose.position.x
+            self.other_robot_y = pose.position.y
 
             self.other_robot_yaw = (
                 self.quaternion_to_yaw(
-                    qx,
-                    qy,
-                    qz,
-                    qw
+                    pose.orientation.x,
+                    pose.orientation.y,
+                    pose.orientation.z,
+                    pose.orientation.w
                 )
             )
 
-            if other_index < len(msg.twist):
+            if index < len(msg.twist):
 
-                self.other_robot_v = (
-                    msg.twist[
-                        other_index
-                    ].linear.x
+                self.other_robot_v = max(
+                    0.0,
+                    msg.twist[index].linear.x
                 )
 
                 self.other_robot_w = (
-                    msg.twist[
-                        other_index
-                    ].angular.z
+                    msg.twist[index].angular.z
                 )
 
-            self.other_robot_v = max(
-                0.0,
-                self.other_robot_v
-            )
-
     # =================================================================
-    # LaserScan callback
+    # Laser callback
     # =================================================================
 
     def scan_callback(self, msg):
@@ -752,16 +515,6 @@ class RobotPathTracker:
         if self.robot_yaw is None:
 
             return
-
-        # ============================================================
-        # LaserScan -> World
-        #
-        # 默认：
-        #
-        # LaserScan frame == robot base frame
-        #
-        # 如果 laser 有 TF 偏移，需要改成 TF2 转换。
-        # ============================================================
 
         points = []
 
@@ -777,47 +530,30 @@ class RobotPathTracker:
 
         for distance in msg.ranges:
 
-            # --------------------------------------------------------
-            # Invalid
-            # --------------------------------------------------------
-
             if not math.isfinite(distance):
 
                 angle += msg.angle_increment
-
                 continue
 
             if distance < msg.range_min:
 
                 angle += msg.angle_increment
-
                 continue
 
             if distance > msg.range_max:
 
                 angle += msg.angle_increment
-
                 continue
 
-            # --------------------------------------------------------
-            # Laser frame
-            # --------------------------------------------------------
-
             local_x = (
-                distance
-                *
+                distance *
                 math.cos(angle)
             )
 
             local_y = (
-                distance
-                *
+                distance *
                 math.sin(angle)
             )
-
-            # --------------------------------------------------------
-            # Robot frame -> World
-            # --------------------------------------------------------
 
             world_x = (
                 self.robot_x
@@ -863,29 +599,7 @@ class RobotPathTracker:
         self.last_scan_time = rospy.Time.now()
 
     # =================================================================
-    # Check Scan freshness
-    # =================================================================
-
-    def scan_is_fresh(self):
-
-        if not self.scan_received:
-
-            return False
-
-        if self.last_scan_time is None:
-
-            return False
-
-        age = (
-            rospy.Time.now()
-            -
-            self.last_scan_time
-        ).to_sec()
-
-        return age <= self.scan_timeout
-
-    # =================================================================
-    # Quaternion -> yaw
+    # Quaternion
     # =================================================================
 
     @staticmethod
@@ -897,8 +611,7 @@ class RobotPathTracker:
     ):
 
         sin_yaw = (
-            2.0
-            *
+            2.0 *
             (
                 qw * qz
                 +
@@ -907,13 +620,10 @@ class RobotPathTracker:
         )
 
         cos_yaw = (
-            1.0
-            -
-            2.0
-            *
+            1.0 -
+            2.0 *
             (
-                qy * qy
-                +
+                qy * qy +
                 qz * qz
             )
         )
@@ -952,14 +662,13 @@ class RobotPathTracker:
         y2
     ):
 
-        return math.sqrt(
-            (x2 - x1) ** 2
-            +
-            (y2 - y1) ** 2
+        return math.hypot(
+            x2 - x1,
+            y2 - y1
         )
 
     # =================================================================
-    # Find nearest path index
+    # Find nearest path point
     # =================================================================
 
     def find_nearest_path_index(self):
@@ -968,21 +677,32 @@ class RobotPathTracker:
 
             return None
 
+        start = max(
+            0,
+            self.current_target_index - 20
+        )
+
+        end = min(
+            len(self.path_points),
+            self.current_target_index
+            +
+            self.path_search_forward
+        )
+
         min_distance = float("inf")
 
-        nearest_index = self.current_target_index
-
-        start_index = max(
-            0,
-            self.current_target_index - 10
+        nearest_index = (
+            self.current_target_index
         )
 
         for index in range(
-            start_index,
-            len(self.path_points)
+            start,
+            end
         ):
 
-            px, py = self.path_points[index]
+            px, py = (
+                self.path_points[index]
+            )
 
             distance = self.distance(
                 self.robot_x,
@@ -994,13 +714,12 @@ class RobotPathTracker:
             if distance < min_distance:
 
                 min_distance = distance
-
                 nearest_index = index
 
         return nearest_index
 
     # =================================================================
-    # Find lookahead index
+    # Lookahead
     # =================================================================
 
     def find_lookahead_index(
@@ -1017,7 +736,9 @@ class RobotPathTracker:
             len(self.path_points)
         ):
 
-            px, py = self.path_points[index]
+            px, py = (
+                self.path_points[index]
+            )
 
             distance = self.distance(
                 self.robot_x,
@@ -1035,7 +756,7 @@ class RobotPathTracker:
         ) - 1
 
     # =================================================================
-    # Update target index
+    # Update target
     # =================================================================
 
     def update_target_index(self):
@@ -1066,7 +787,50 @@ class RobotPathTracker:
         return self.current_target_index
 
     # =================================================================
-    # Check final goal
+    # Path heading
+    # =================================================================
+
+    def get_path_heading(
+        self,
+        index
+    ):
+
+        if not self.path_points:
+
+            return self.robot_yaw
+
+        i1 = max(
+            0,
+            index - 2
+        )
+
+        i2 = min(
+            len(self.path_points) - 1,
+            index + 3
+        )
+
+        x1, y1 = (
+            self.path_points[i1]
+        )
+
+        x2, y2 = (
+            self.path_points[i2]
+        )
+
+        dx = x2 - x1
+        dy = y2 - y1
+
+        if math.hypot(dx, dy) < 1e-6:
+
+            return self.robot_yaw
+
+        return math.atan2(
+            dy,
+            dx
+        )
+
+    # =================================================================
+    # Goal
     # =================================================================
 
     def check_goal(self):
@@ -1093,21 +857,8 @@ class RobotPathTracker:
             self.stop()
 
             rospy.loginfo(
-                "=========================================="
-            )
-
-            rospy.loginfo(
-                "Robot%d coverage path finished.",
+                "Robot%d path finished.",
                 self.robot_id
-            )
-
-            rospy.loginfo(
-                "Final distance: %.3f m",
-                distance
-            )
-
-            rospy.loginfo(
-                "=========================================="
             )
 
             return True
@@ -1124,69 +875,40 @@ class RobotPathTracker:
         current_w
     ):
 
-        # ------------------------------------------------------------
-        # 非常重要：
-        #
-        # Dynamic Window 是一个“控制周期内”的速度变化范围。
-        #
-        # 20 Hz:
-        #
-        #     control_dt = 0.05 s
-        #
-        # 不是 dwa_dt = 0.10 s。
-        # ------------------------------------------------------------
-
-        control_dt = (
-            1.0
-            /
+        dt = (
+            1.0 /
             max(
                 self.control_frequency,
                 1e-6
             )
         )
 
-        # ============================================================
-        # Linear
-        # ============================================================
-
         v_min = max(
-            self.min_linear_speed,
+            0.0,
             current_v
             -
-            self.max_linear_accel
-            *
-            control_dt
+            self.max_linear_accel * dt
         )
 
         v_max = min(
             self.max_linear_speed,
             current_v
             +
-            self.max_linear_accel
-            *
-            control_dt
+            self.max_linear_accel * dt
         )
-
-        # ============================================================
-        # Angular
-        # ============================================================
 
         w_min = max(
             -self.max_angular_speed,
             current_w
             -
-            self.max_angular_accel
-            *
-            control_dt
+            self.max_angular_accel * dt
         )
 
         w_max = min(
             self.max_angular_speed,
             current_w
             +
-            self.max_angular_accel
-            *
-            control_dt
+            self.max_angular_accel * dt
         )
 
         return (
@@ -1212,38 +934,33 @@ class RobotPathTracker:
         y = self.robot_y
         yaw = self.robot_yaw
 
-        elapsed_time = 0.0
+        elapsed = 0.0
 
-        while elapsed_time <= self.dwa_predict_time:
+        while elapsed <= self.dwa_predict_time:
 
             trajectory.append(
                 (
                     x,
                     y,
                     yaw,
-                    elapsed_time
+                    elapsed
                 )
             )
 
             x += (
-                v
-                *
-                math.cos(yaw)
-                *
+                v *
+                math.cos(yaw) *
                 self.dwa_dt
             )
 
             y += (
-                v
-                *
-                math.sin(yaw)
-                *
+                v *
+                math.sin(yaw) *
                 self.dwa_dt
             )
 
             yaw += (
-                w
-                *
+                w *
                 self.dwa_dt
             )
 
@@ -1251,12 +968,12 @@ class RobotPathTracker:
                 yaw
             )
 
-            elapsed_time += self.dwa_dt
+            elapsed += self.dwa_dt
 
         return trajectory
 
     # =================================================================
-    # Collision with LaserScan obstacles
+    # Obstacle collision
     # =================================================================
 
     def trajectory_collision_obstacles(
@@ -1264,30 +981,34 @@ class RobotPathTracker:
         trajectory
     ):
 
-        if (
+        if len(
             self.obstacle_points_world
-            is None
-            or
-            len(self.obstacle_points_world) == 0
-        ):
+        ) == 0:
 
             return False
 
-        safe_radius = (
+        collision_distance = (
             self.robot_radius
             +
             self.obstacle_margin
         )
 
-        safe_radius_sq = (
-            safe_radius
-            *
-            safe_radius
+        collision_distance_sq = (
+            collision_distance ** 2
         )
 
-        obstacle_points = (
+        points = (
             self.obstacle_points_world
         )
+
+        # ------------------------------------------------------------
+        # 对原地旋转：
+        #
+        # 不能简单把旋转中心和 LaserScan 障碍物判碰撞，
+        # 否则机器人靠近障碍物时永远不能转向。
+        #
+        # 这里只判断机器人中心是否已经进入真正碰撞范围。
+        # ------------------------------------------------------------
 
         for state in trajectory:
 
@@ -1295,27 +1016,22 @@ class RobotPathTracker:
             y = state[1]
 
             dx = (
-                obstacle_points[:, 0]
-                -
-                x
+                points[:, 0] - x
             )
 
             dy = (
-                obstacle_points[:, 1]
-                -
-                y
+                points[:, 1] - y
             )
 
             distance_sq = (
-                dx * dx
-                +
+                dx * dx +
                 dy * dy
             )
 
             if np.any(
                 distance_sq
-                <=
-                safe_radius_sq
+                <
+                collision_distance_sq
             ):
 
                 return True
@@ -1323,7 +1039,7 @@ class RobotPathTracker:
         return False
 
     # =================================================================
-    # Predict other robot
+    # Other robot prediction
     # =================================================================
 
     def predict_other_robot_position(
@@ -1339,25 +1055,18 @@ class RobotPathTracker:
 
             return None
 
-        # ------------------------------------------------------------
-        # 简单恒定速度模型
-        # ------------------------------------------------------------
-
-        if self.other_robot_yaw is None:
-
-            return (
-                self.other_robot_x,
-                self.other_robot_y
-            )
+        yaw = (
+            self.other_robot_yaw
+            if self.other_robot_yaw is not None
+            else 0.0
+        )
 
         x = (
             self.other_robot_x
             +
             self.other_robot_v
             *
-            math.cos(
-                self.other_robot_yaw
-            )
+            math.cos(yaw)
             *
             time
         )
@@ -1367,20 +1076,15 @@ class RobotPathTracker:
             +
             self.other_robot_v
             *
-            math.sin(
-                self.other_robot_yaw
-            )
+            math.sin(yaw)
             *
             time
         )
 
-        return (
-            x,
-            y
-        )
+        return x, y
 
     # =================================================================
-    # Collision with other robot
+    # Robot collision
     # =================================================================
 
     def trajectory_collision_robot(
@@ -1397,65 +1101,265 @@ class RobotPathTracker:
             return False
 
         safe_distance = (
+            2.0 *
             self.robot_radius
             +
             self.robot_collision_margin
-            +
-            self.robot_radius
         )
 
         safe_distance_sq = (
-            safe_distance
-            *
-            safe_distance
+            safe_distance ** 2
         )
 
         for state in trajectory:
 
             x = state[0]
             y = state[1]
-            time = state[3]
+            t = state[3]
 
-            other_position = (
+            other = (
                 self.predict_other_robot_position(
-                    time
+                    t
                 )
             )
 
-            if other_position is None:
+            if other is None:
 
                 continue
 
-            other_x, other_y = (
-                other_position
-            )
+            ox, oy = other
 
-            dx = (
-                x
-                -
-                other_x
-            )
+            dx = x - ox
+            dy = y - oy
 
-            dy = (
-                y
-                -
-                other_y
-            )
-
-            distance_sq = (
-                dx * dx
-                +
+            if (
+                dx * dx +
                 dy * dy
-            )
-
-            if distance_sq <= safe_distance_sq:
+                <
+                safe_distance_sq
+            ):
 
                 return True
 
         return False
 
     # =================================================================
-    # Minimum static obstacle distance
+    # Average path error
+    # =================================================================
+
+    def trajectory_path_error(
+        self,
+        trajectory
+    ):
+
+        if not self.path_points:
+
+            return float("inf")
+
+        total_error = 0.0
+
+        count = 0
+
+        points = np.asarray(
+            self.path_points,
+            dtype=np.float64
+        )
+
+        # ------------------------------------------------------------
+        # 只搜索当前附近路径
+        # ------------------------------------------------------------
+
+        start = max(
+            0,
+            self.current_target_index - 15
+        )
+
+        end = min(
+            len(points),
+            self.current_target_index
+            +
+            self.path_search_forward
+        )
+
+        local_points = points[
+            start:end
+        ]
+
+        if len(local_points) == 0:
+
+            return float("inf")
+
+        for state in trajectory:
+
+            x = state[0]
+            y = state[1]
+
+            dx = (
+                local_points[:, 0] - x
+            )
+
+            dy = (
+                local_points[:, 1] - y
+            )
+
+            distance_sq = (
+                dx * dx +
+                dy * dy
+            )
+
+            min_distance = math.sqrt(
+                float(
+                    np.min(
+                        distance_sq
+                    )
+                )
+            )
+
+            total_error += min_distance
+
+            count += 1
+
+        if count == 0:
+
+            return float("inf")
+
+        return (
+            total_error / count
+        )
+
+    # =================================================================
+    # Final path index
+    # =================================================================
+
+    def trajectory_path_progress(
+        self,
+        trajectory
+    ):
+
+        if not self.path_points:
+
+            return self.current_target_index
+
+        final_x = trajectory[-1][0]
+        final_y = trajectory[-1][1]
+
+        start = max(
+            0,
+            self.current_target_index - 10
+        )
+
+        end = min(
+            len(self.path_points),
+            self.current_target_index
+            +
+            self.path_search_forward
+        )
+
+        min_distance = float("inf")
+
+        best_index = (
+            self.current_target_index
+        )
+
+        for index in range(
+            start,
+            end
+        ):
+
+            px, py = (
+                self.path_points[index]
+            )
+
+            distance = self.distance(
+                final_x,
+                final_y,
+                px,
+                py
+            )
+
+            if distance < min_distance:
+
+                min_distance = distance
+                best_index = index
+
+        return best_index
+
+    # =================================================================
+    # Trajectory heading error
+    # =================================================================
+
+    def trajectory_heading_error(
+        self,
+        trajectory
+    ):
+
+        if not self.path_points:
+
+            return math.pi
+
+        final_x = trajectory[-1][0]
+        final_y = trajectory[-1][1]
+        final_yaw = trajectory[-1][2]
+
+        # ------------------------------------------------------------
+        # 找预测终点最近路径点
+        # ------------------------------------------------------------
+
+        start = max(
+            0,
+            self.current_target_index - 10
+        )
+
+        end = min(
+            len(self.path_points),
+            self.current_target_index
+            +
+            self.path_search_forward
+        )
+
+        min_distance = float("inf")
+
+        nearest_index = (
+            self.current_target_index
+        )
+
+        for index in range(
+            start,
+            end
+        ):
+
+            px, py = (
+                self.path_points[index]
+            )
+
+            distance = self.distance(
+                final_x,
+                final_y,
+                px,
+                py
+            )
+
+            if distance < min_distance:
+
+                min_distance = distance
+                nearest_index = index
+
+        path_yaw = (
+            self.get_path_heading(
+                nearest_index
+            )
+        )
+
+        error = abs(
+            self.normalize_angle(
+                path_yaw - final_yaw
+            )
+        )
+
+        return error
+
+    # =================================================================
+    # Minimum obstacle distance
     # =================================================================
 
     def minimum_obstacle_distance(
@@ -1463,58 +1367,112 @@ class RobotPathTracker:
         trajectory
     ):
 
-        min_distance = float("inf")
-
-        if (
+        if len(
             self.obstacle_points_world
-            is not None
-            and
-            len(self.obstacle_points_world) > 0
-        ):
+        ) == 0:
 
-            points = (
-                self.obstacle_points_world
+            return float("inf")
+
+        points = (
+            self.obstacle_points_world
+        )
+
+        minimum = float("inf")
+
+        for state in trajectory:
+
+            x = state[0]
+            y = state[1]
+
+            dx = (
+                points[:, 0] - x
             )
 
-            for state in trajectory:
+            dy = (
+                points[:, 1] - y
+            )
 
-                x = state[0]
-                y = state[1]
+            distance_sq = (
+                dx * dx +
+                dy * dy
+            )
 
-                dx = (
-                    points[:, 0]
-                    -
-                    x
-                )
-
-                dy = (
-                    points[:, 1]
-                    -
-                    y
-                )
-
-                distance_sq = (
-                    dx * dx
-                    +
-                    dy * dy
-                )
-
-                local_min = math.sqrt(
-                    float(
-                        np.min(
-                            distance_sq
-                        )
+            d = math.sqrt(
+                float(
+                    np.min(
+                        distance_sq
                     )
                 )
+            )
 
-                if local_min < min_distance:
+            minimum = min(
+                minimum,
+                d
+            )
 
-                    min_distance = local_min
-
-        return min_distance
+        return minimum
 
     # =================================================================
-    # Minimum other robot distance
+    # Obstacle score
+    # =================================================================
+
+    def obstacle_score(
+        self,
+        trajectory
+    ):
+
+        d = (
+            self.minimum_obstacle_distance(
+                trajectory
+            )
+        )
+
+        if not math.isfinite(d):
+
+            return 1.0
+
+        collision_distance = (
+            self.robot_radius
+            +
+            self.obstacle_margin
+        )
+
+        if d <= collision_distance:
+
+            return -1.0
+
+        if (
+            d >=
+            self.preferred_obstacle_distance
+        ):
+
+            return 1.0
+
+        denominator = (
+            self.preferred_obstacle_distance
+            -
+            collision_distance
+        )
+
+        if denominator <= 1e-6:
+
+            return 0.0
+
+        score = (
+            d -
+            collision_distance
+        ) / denominator
+
+        return max(
+            0.0,
+            min(
+                1.0,
+                score
+            )
+        )
+
+    # =================================================================
+    # Robot score
     # =================================================================
 
     def minimum_robot_distance(
@@ -1522,395 +1480,97 @@ class RobotPathTracker:
         trajectory
     ):
 
-        min_distance = float("inf")
-
         if (
             self.other_robot_x is None
             or
             self.other_robot_y is None
         ):
 
-            return min_distance
+            return float("inf")
+
+        minimum = float("inf")
 
         for state in trajectory:
 
             x = state[0]
             y = state[1]
-            time = state[3]
+            t = state[3]
 
-            other_position = (
+            other = (
                 self.predict_other_robot_position(
-                    time
+                    t
                 )
             )
 
-            if other_position is None:
+            if other is None:
 
                 continue
 
-            other_x, other_y = (
-                other_position
-            )
+            ox, oy = other
 
-            distance = self.distance(
+            d = self.distance(
                 x,
                 y,
-                other_x,
-                other_y
+                ox,
+                oy
             )
 
-            if distance < min_distance:
-
-                min_distance = distance
-
-        return min_distance
-
-    # =================================================================
-    # Distance to global path
-    # =================================================================
-
-    def distance_to_global_path(
-        self,
-        x,
-        y
-    ):
-
-        if not self.path_points:
-
-            return float("inf")
-
-        min_distance = float("inf")
-
-        start = max(
-            0,
-            self.current_target_index - 10
-        )
-
-        end = min(
-            len(self.path_points),
-            self.current_target_index + 80
-        )
-
-        for index in range(
-            start,
-            end
-        ):
-
-            px, py = self.path_points[index]
-
-            distance = self.distance(
-                x,
-                y,
-                px,
-                py
+            minimum = min(
+                minimum,
+                d
             )
 
-            if distance < min_distance:
-
-                min_distance = distance
-
-        return min_distance
+        return minimum
 
     # =================================================================
-    # Get path progress
+    # Robot clearance score
     # =================================================================
 
-    def get_path_progress(
-        self,
-        x,
-        y
-    ):
-
-        if not self.path_points:
-
-            return self.current_target_index
-
-        start = max(
-            0,
-            self.current_target_index - 10
-        )
-
-        end = min(
-            len(self.path_points),
-            self.current_target_index + 80
-        )
-
-        nearest_index = (
-            self.current_target_index
-        )
-
-        min_distance = float("inf")
-
-        for index in range(
-            start,
-            end
-        ):
-
-            px, py = self.path_points[index]
-
-            distance = self.distance(
-                x,
-                y,
-                px,
-                py
-            )
-
-            if distance < min_distance:
-
-                min_distance = distance
-
-                nearest_index = index
-
-        return nearest_index
-
-    # =================================================================
-    # Heading score
-    # =================================================================
-
-    def calculate_heading_score(
-        self,
-        x,
-        y,
-        yaw
-    ):
-
-        if not self.path_points:
-
-            return 0.0
-
-        # ------------------------------------------------------------
-        # 找预测终点附近的路径点
-        # ------------------------------------------------------------
-
-        min_distance = float("inf")
-
-        nearest_index = (
-            self.current_target_index
-        )
-
-        start = max(
-            0,
-            self.current_target_index - 5
-        )
-
-        end = min(
-            len(self.path_points),
-            self.current_target_index + 80
-        )
-
-        for index in range(
-            start,
-            end
-        ):
-
-            px, py = self.path_points[index]
-
-            distance = self.distance(
-                x,
-                y,
-                px,
-                py
-            )
-
-            if distance < min_distance:
-
-                min_distance = distance
-
-                nearest_index = index
-
-        # ------------------------------------------------------------
-        # 向前看一些路径点
-        # ------------------------------------------------------------
-
-        target_index = min(
-            len(self.path_points) - 1,
-            nearest_index + 5
-        )
-
-        target_x, target_y = (
-            self.path_points[
-                target_index
-            ]
-        )
-
-        dx = target_x - x
-        dy = target_y - y
-
-        if (
-            abs(dx) < 1e-6
-            and
-            abs(dy) < 1e-6
-        ):
-
-            return 1.0
-
-        target_yaw = math.atan2(
-            dy,
-            dx
-        )
-
-        yaw_error = self.normalize_angle(
-            target_yaw - yaw
-        )
-
-        # ------------------------------------------------------------
-        # cos：
-        #
-        # 同向       -> 1
-        # 90度       -> 0
-        # 180度      -> -1
-        # ------------------------------------------------------------
-
-        return math.cos(
-            yaw_error
-        )
-
-    # =================================================================
-    # Static obstacle clearance score
-    # =================================================================
-
-    def calculate_obstacle_score(
+    def robot_score(
         self,
         trajectory
     ):
 
-        min_distance = (
-            self.minimum_obstacle_distance(
-                trajectory
-            )
-        )
-
-        # ------------------------------------------------------------
-        # 没有 LaserScan 障碍点
-        # ------------------------------------------------------------
-
-        if not math.isfinite(
-            min_distance
-        ):
-
-            return 1.0
-
-        safe_distance = (
-            self.robot_radius
-            +
-            self.obstacle_margin
-        )
-
-        # ------------------------------------------------------------
-        # 已经进入安全范围
-        # ------------------------------------------------------------
-
-        if min_distance <= safe_distance:
-
-            return -1.0
-
-        # ------------------------------------------------------------
-        # 超过 preferred distance：
-        #
-        # 不再继续奖励。
-        #
-        # 例如：
-        #
-        # 0.8m -> 1.0
-        # 1.5m -> 1.0
-        # 2.5m -> 1.0
-        #
-        # 避免“离障碍物越远越慢”。
-        # ------------------------------------------------------------
-
-        if (
-            min_distance
-            >=
-            self.preferred_obstacle_distance
-        ):
-
-            return 1.0
-
-        # ------------------------------------------------------------
-        # safe_distance ~ preferred_distance
-        # ------------------------------------------------------------
-
-        score = (
-            min_distance
-            -
-            safe_distance
-        ) / (
-            self.preferred_obstacle_distance
-            -
-            safe_distance
-        )
-
-        return max(
-            0.0,
-            min(
-                1.0,
-                score
-            )
-        )
-
-    # =================================================================
-    # Other robot clearance score
-    # =================================================================
-
-    def calculate_robot_score(
-        self,
-        trajectory
-    ):
-
-        min_distance = (
+        d = (
             self.minimum_robot_distance(
                 trajectory
             )
         )
 
-        if not math.isfinite(
-            min_distance
-        ):
+        if not math.isfinite(d):
 
             return 1.0
 
-        safe_distance = (
+        collision_distance = (
+            2.0 *
             self.robot_radius
             +
             self.robot_collision_margin
-            +
-            self.robot_radius
         )
 
-        if min_distance <= safe_distance:
+        if d <= collision_distance:
 
             return -1.0
 
-        preferred_distance = (
-            safe_distance
-            +
+        preferred = (
+            collision_distance +
             0.8
         )
 
-        if min_distance >= preferred_distance:
+        if d >= preferred:
 
             return 1.0
 
-        score = (
-            min_distance
-            -
-            safe_distance
+        return (
+            d -
+            collision_distance
         ) / (
-            preferred_distance
-            -
-            safe_distance
-        )
-
-        return max(
-            0.0,
-            min(
-                1.0,
-                score
-            )
+            preferred -
+            collision_distance
         )
 
     # =================================================================
-    # Calculate DWA score
+    # DWA score
     # =================================================================
 
     def calculate_dwa_score(
@@ -1920,126 +1580,73 @@ class RobotPathTracker:
         w
     ):
 
-        if not trajectory:
-
-            return -float("inf")
-
-        final_x = trajectory[-1][0]
-        final_y = trajectory[-1][1]
-        final_yaw = trajectory[-1][2]
-
         # ============================================================
-        # 1. Path score
+        # Path error
         # ============================================================
 
-        path_distance = (
-            self.distance_to_global_path(
-                final_x,
-                final_y
+        path_error = (
+            self.trajectory_path_error(
+                trajectory
             )
         )
 
         if not math.isfinite(
-            path_distance
+            path_error
         ):
 
             path_score = 0.0
 
         else:
 
-            # --------------------------------------------------------
-            # 距离路径越近越好
-            # --------------------------------------------------------
-
-            path_scale = 0.50
-
             path_score = math.exp(
-                -path_distance
-                /
-                path_scale
+                -path_error /
+                max(
+                    self.path_error_scale,
+                    1e-6
+                )
             )
 
         # ============================================================
-        # 2. Heading score
+        # Heading
         # ============================================================
 
-        heading_score = (
-            self.calculate_heading_score(
-                final_x,
-                final_y,
-                final_yaw
-            )
-        )
-
-        # ------------------------------------------------------------
-        # 将 [-1, 1] 映射到 [0, 1]
-        # ------------------------------------------------------------
-
-        heading_score = (
-            0.5
-            *
-            (
-                heading_score
-                +
-                1.0
+        heading_error = (
+            self.trajectory_heading_error(
+                trajectory
             )
         )
 
-        # ============================================================
-        # 3. Velocity score
-        # ============================================================
+        heading_score = (
+            1.0 -
+            heading_error / math.pi
+        )
 
-        if self.max_linear_speed > 1e-6:
-
-            velocity_score = (
-                v
-                /
-                self.max_linear_speed
-            )
-
-        else:
-
-            velocity_score = 0.0
-
-        velocity_score = max(
+        heading_score = max(
             0.0,
             min(
                 1.0,
-                velocity_score
+                heading_score
             )
         )
 
         # ============================================================
-        # 4. Progress score
+        # Progress
         # ============================================================
 
         progress_index = (
-            self.get_path_progress(
-                final_x,
-                final_y
+            self.trajectory_path_progress(
+                trajectory
             )
         )
 
         progress = (
-            progress_index
-            -
+            progress_index -
             self.current_target_index
         )
 
-        # ------------------------------------------------------------
-        # 如果预测终点没有向前：
-        #
-        # score = 0
-        #
-        # 如果向前 10 个 Path point：
-        #
-        # score ≈ 1
-        # ------------------------------------------------------------
-
         progress_score = (
-            progress
-            /
-            10.0
+            progress /
+            15.0
         )
 
         progress_score = max(
@@ -2051,32 +1658,51 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # 5. Static obstacle score
+        # Velocity
+        # ============================================================
+
+        velocity_score = (
+            v /
+            max(
+                self.max_linear_speed,
+                1e-6
+            )
+        )
+
+        velocity_score = max(
+            0.0,
+            min(
+                1.0,
+                velocity_score
+            )
+        )
+
+        # ============================================================
+        # Obstacle
         # ============================================================
 
         obstacle_score = (
-            self.calculate_obstacle_score(
+            self.obstacle_score(
                 trajectory
             )
         )
 
         # ============================================================
-        # 6. Other robot score
+        # Other robot
         # ============================================================
 
         robot_score = (
-            self.calculate_robot_score(
+            self.robot_score(
                 trajectory
             )
         )
 
         # ============================================================
-        # 7. Angular penalty
+        # Angular penalty
         # ============================================================
 
         angular_penalty = (
-            abs(w)
-            /
+            abs(w) /
             max(
                 self.max_angular_speed,
                 1e-6
@@ -2084,63 +1710,49 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # 8. Total score
+        # Total
         # ============================================================
 
         score = (
 
-            # Path following
-            self.path_weight
-            *
+            self.path_weight *
             path_score
 
             +
 
-            # Heading
-            self.heading_weight
-            *
+            self.heading_weight *
             heading_score
 
             +
 
-            # Speed
-            self.velocity_weight
-            *
-            velocity_score
-
-            +
-
-            # Forward progress
-            self.progress_weight
-            *
+            self.progress_weight *
             progress_score
 
             +
 
-            # Static obstacle
-            self.obstacle_weight
-            *
+            self.velocity_weight *
+            velocity_score
+
+            +
+
+            self.obstacle_weight *
             obstacle_score
 
             +
 
-            # Other robot
-            self.robot_weight
-            *
+            self.robot_weight *
             robot_score
 
             -
 
-            # Excessive turning
-            self.angular_penalty_weight
-            *
+            self.angular_penalty_weight *
             angular_penalty
         )
 
         return score
 
     # =================================================================
-    # DWA main
+    # DWA
     # =================================================================
 
     def dwa_control(self):
@@ -2155,57 +1767,54 @@ class RobotPathTracker:
             self.robot_w
         )
 
-        # ============================================================
-        # Ensure valid window
-        # ============================================================
+        # ------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # 即使当前 v=0，也强制加入：
+        #
+        #     v=0
+        #
+        # 这样机器人可以原地旋转。
+        # ------------------------------------------------------------
 
-        if v_max < v_min:
-
-            v_max = v_min
-
-        if w_max < w_min:
-
-            w_max = w_min
-
-        # ============================================================
-        # Velocity Samples
-        # ============================================================
-
-        if self.linear_samples <= 1:
-
-            v_samples = [
-                v_max
-            ]
-
-        else:
-
-            v_samples = np.linspace(
-                v_min,
-                v_max,
+        v_samples = np.linspace(
+            v_min,
+            v_max,
+            max(
+                2,
                 self.linear_samples
             )
+        )
 
-        # ============================================================
-        # Angular Samples
-        # ============================================================
-
-        if self.angular_samples <= 1:
-
-            w_samples = [
+        v_samples = np.unique(
+            np.append(
+                v_samples,
                 0.0
-            ]
+            )
+        )
 
-        else:
-
-            w_samples = np.linspace(
-                w_min,
-                w_max,
+        w_samples = np.linspace(
+            w_min,
+            w_max,
+            max(
+                3,
                 self.angular_samples
             )
+        )
 
-        # ============================================================
-        # Best trajectory
-        # ============================================================
+        # ------------------------------------------------------------
+        # 如果角速度窗口太小，加入较大的恢复角速度
+        # ------------------------------------------------------------
+
+        w_samples = np.unique(
+            np.append(
+                w_samples,
+                [
+                    -self.recovery_rotate_speed,
+                    self.recovery_rotate_speed
+                ]
+            )
+        )
 
         best_score = -float("inf")
 
@@ -2215,7 +1824,7 @@ class RobotPathTracker:
         feasible_count = 0
 
         # ============================================================
-        # Evaluate all velocity pairs
+        # Search
         # ============================================================
 
         for v in v_samples:
@@ -2233,7 +1842,7 @@ class RobotPathTracker:
                 )
 
                 # ----------------------------------------------------
-                # Static obstacle collision
+                # Static obstacle
                 # ----------------------------------------------------
 
                 if self.trajectory_collision_obstacles(
@@ -2243,7 +1852,7 @@ class RobotPathTracker:
                     continue
 
                 # ----------------------------------------------------
-                # Other robot collision
+                # Other robot
                 # ----------------------------------------------------
 
                 if self.trajectory_collision_robot(
@@ -2262,28 +1871,45 @@ class RobotPathTracker:
                     )
                 )
 
-                if score > best_score:
+                # ----------------------------------------------------
+                # Prefer moving trajectories when scores similar
+                # ----------------------------------------------------
+
+                if (
+                    v > 0.0
+                    and
+                    score > best_score
+                ):
 
                     best_score = score
+                    best_v = v
+                    best_w = w
 
+                elif (
+                    v == 0.0
+                    and
+                    best_score == -float("inf")
+                ):
+
+                    best_score = score
                     best_v = v
                     best_w = w
 
         # ============================================================
-        # No safe trajectory
+        # No trajectory
         # ============================================================
 
         if feasible_count == 0:
 
             rospy.logwarn_throttle(
                 1.0,
-                "Robot%d DWA: no safe trajectory. STOP.",
+                "Robot%d: no safe DWA trajectory.",
                 self.robot_id
             )
 
             return (
-                0.0,
-                0.0,
+                None,
+                None,
                 -float("inf")
             )
 
@@ -2294,13 +1920,179 @@ class RobotPathTracker:
         )
 
     # =================================================================
-    # Control
+    # Start recovery
+    # =================================================================
+
+    def start_recovery(self):
+
+        if self.recovery_mode:
+
+            return
+
+        self.recovery_mode = True
+
+        self.recovery_start_time = (
+            rospy.Time.now()
+        )
+
+        self.recovery_start_yaw = (
+            self.robot_yaw
+        )
+
+        # ------------------------------------------------------------
+        # 根据 path heading 决定旋转方向
+        # ------------------------------------------------------------
+
+        target_index = (
+            self.update_target_index()
+        )
+
+        if target_index is not None:
+
+            path_yaw = (
+                self.get_path_heading(
+                    target_index
+                )
+            )
+
+            yaw_error = self.normalize_angle(
+                path_yaw -
+                self.robot_yaw
+            )
+
+            if yaw_error >= 0.0:
+
+                self.recovery_direction = 1.0
+
+            else:
+
+                self.recovery_direction = -1.0
+
+        else:
+
+            self.recovery_direction = 1.0
+
+        rospy.logwarn(
+            "Robot%d entering rotation recovery.",
+            self.robot_id
+        )
+
+    # =================================================================
+    # Recovery control
+    # =================================================================
+
+    def recovery_control(self):
+
+        if not self.recovery_mode:
+
+            return False
+
+        elapsed = (
+            rospy.Time.now()
+            -
+            self.recovery_start_time
+        ).to_sec()
+
+        # ------------------------------------------------------------
+        # Timeout
+        # ------------------------------------------------------------
+
+        if elapsed >= self.recovery_timeout:
+
+            rospy.logwarn(
+                "Robot%d recovery timeout.",
+                self.robot_id
+            )
+
+            self.recovery_mode = False
+
+            return False
+
+        # ------------------------------------------------------------
+        # 当前 path heading
+        # ------------------------------------------------------------
+
+        target_index = (
+            self.update_target_index()
+        )
+
+        if target_index is None:
+
+            self.stop()
+
+            return True
+
+        path_yaw = (
+            self.get_path_heading(
+                target_index
+            )
+        )
+
+        yaw_error = self.normalize_angle(
+            path_yaw -
+            self.robot_yaw
+        )
+
+        # ------------------------------------------------------------
+        # 如果已经基本朝向 path
+        # ------------------------------------------------------------
+
+        if abs(yaw_error) < 0.20:
+
+            self.recovery_mode = False
+
+            rospy.loginfo(
+                "Robot%d recovery finished.",
+                self.robot_id
+            )
+
+            return False
+
+        # ------------------------------------------------------------
+        # 旋转
+        # ------------------------------------------------------------
+
+        angular = (
+            self.recovery_direction
+            *
+            self.recovery_rotate_speed
+        )
+
+        # ------------------------------------------------------------
+        # 如果方向判断发生变化
+        # ------------------------------------------------------------
+
+        if yaw_error > 0.0:
+
+            angular = (
+                self.recovery_rotate_speed
+            )
+
+        else:
+
+            angular = (
+                -self.recovery_rotate_speed
+            )
+
+        cmd = Twist()
+
+        cmd.linear.x = 0.0
+        cmd.angular.z = angular
+
+        self.cmd_pub.publish(
+            cmd
+        )
+
+        return True
+
+    # =================================================================
+    # Main control
     # =================================================================
 
     def control(self):
 
         # ============================================================
-        # No Path
+        # Path
         # ============================================================
 
         if not self.path_received:
@@ -2310,7 +2102,7 @@ class RobotPathTracker:
             return
 
         # ============================================================
-        # No Pose
+        # Pose
         # ============================================================
 
         if not self.pose_received:
@@ -2320,14 +2112,14 @@ class RobotPathTracker:
             return
 
         # ============================================================
-        # No fresh LaserScan
+        # Scan
         # ============================================================
 
         if not self.scan_is_fresh():
 
             rospy.logwarn_throttle(
                 2.0,
-                "Robot%d waiting for fresh LaserScan.",
+                "Robot%d waiting for LaserScan.",
                 self.robot_id
             )
 
@@ -2346,7 +2138,7 @@ class RobotPathTracker:
             return
 
         # ============================================================
-        # Path timeout
+        # Timeout
         # ============================================================
 
         if (
@@ -2363,12 +2155,6 @@ class RobotPathTracker:
 
             if age > self.path_timeout:
 
-                rospy.logwarn_throttle(
-                    2.0,
-                    "Robot%d Path timeout. Stop.",
-                    self.robot_id
-                )
-
                 self.stop()
 
                 return
@@ -2382,7 +2168,7 @@ class RobotPathTracker:
             return
 
         # ============================================================
-        # Update global target
+        # Update target
         # ============================================================
 
         target_index = (
@@ -2394,6 +2180,42 @@ class RobotPathTracker:
             self.stop()
 
             return
+
+        # ============================================================
+        # Recovery
+        # ============================================================
+
+        if self.recovery_mode:
+
+            if self.recovery_control():
+
+                return
+
+        # ============================================================
+        # DWA
+        # ============================================================
+
+        (
+            linear_x,
+            angular_z,
+            score
+        ) = self.dwa_control()
+
+        # ============================================================
+        # No feasible trajectory
+        # ============================================================
+
+        if linear_x is None:
+
+            self.start_recovery()
+
+            self.recovery_control()
+
+            return
+
+        # ============================================================
+        # Target distance
+        # ============================================================
 
         target_x, target_y = (
             self.path_points[
@@ -2409,64 +2231,57 @@ class RobotPathTracker:
         )
 
         # ============================================================
-        # Waypoint passed
+        # Reduce speed when close to waypoint
         # ============================================================
 
-        if target_distance <= self.waypoint_tolerance:
+        if target_distance < 0.30:
 
-            if (
-                self.current_target_index
-                <
-                len(self.path_points) - 1
-            ):
-
-                self.current_target_index += 1
-
-        # ============================================================
-        # DWA
-        # ============================================================
-
-        (
-            linear_x,
-            angular_z,
-            score
-        ) = self.dwa_control()
-
-        # ============================================================
-        # Final goal speed reduction
-        # ============================================================
-
-        remaining_points = (
-            len(self.path_points)
-            -
-            self.current_target_index
-        )
-
-        if remaining_points <= 20:
-
-            distance_factor = min(
-                1.0,
-                target_distance
-                /
-                0.5
+            factor = (
+                target_distance /
+                0.30
             )
 
-            linear_x *= (
-                0.3
-                +
-                0.7
-                *
-                distance_factor
+            factor = max(
+                0.25,
+                min(
+                    1.0,
+                    factor
+                )
             )
 
+            linear_x *= factor
+
         # ============================================================
-        # Do not reverse
+        # Final goal slow down
         # ============================================================
 
-        linear_x = max(
-            0.0,
-            linear_x
+        goal_x, goal_y = (
+            self.path_points[-1]
         )
+
+        goal_distance = self.distance(
+            self.robot_x,
+            self.robot_y,
+            goal_x,
+            goal_y
+        )
+
+        if goal_distance < 0.50:
+
+            factor = (
+                goal_distance /
+                0.50
+            )
+
+            factor = max(
+                0.20,
+                min(
+                    1.0,
+                    factor
+                )
+            )
+
+            linear_x *= factor
 
         # ============================================================
         # Publish
@@ -2474,19 +2289,47 @@ class RobotPathTracker:
 
         cmd = Twist()
 
-        cmd.linear.x = linear_x
+        cmd.linear.x = max(
+            0.0,
+            min(
+                self.max_linear_speed,
+                linear_x
+            )
+        )
 
-        cmd.linear.y = 0.0
-        cmd.linear.z = 0.0
-
-        cmd.angular.x = 0.0
-        cmd.angular.y = 0.0
-
-        cmd.angular.z = angular_z
+        cmd.angular.z = max(
+            -self.max_angular_speed,
+            min(
+                self.max_angular_speed,
+                angular_z
+            )
+        )
 
         self.cmd_pub.publish(
             cmd
         )
+
+    # =================================================================
+    # Scan fresh
+    # =================================================================
+
+    def scan_is_fresh(self):
+
+        if not self.scan_received:
+
+            return False
+
+        if self.last_scan_time is None:
+
+            return False
+
+        age = (
+            rospy.Time.now()
+            -
+            self.last_scan_time
+        ).to_sec()
+
+        return age <= self.scan_timeout
 
     # =================================================================
     # Stop
@@ -2497,12 +2340,6 @@ class RobotPathTracker:
         cmd = Twist()
 
         cmd.linear.x = 0.0
-        cmd.linear.y = 0.0
-        cmd.linear.z = 0.0
-
-        cmd.angular.x = 0.0
-        cmd.angular.y = 0.0
-
         cmd.angular.z = 0.0
 
         self.cmd_pub.publish(
@@ -2522,18 +2359,10 @@ class DualRobotPathController:
             "dual_robot_path_controller"
         )
 
-        # ============================================================
-        # Model States
-        # ============================================================
-
         model_states_topic = rospy.get_param(
             "~model_states_topic",
             "/gazebo/model_states"
         )
-
-        # ============================================================
-        # Robot 1
-        # ============================================================
 
         robot1_name = rospy.get_param(
             "~robot1_name",
@@ -2545,11 +2374,13 @@ class DualRobotPathController:
             "robot2"
         )
 
+        # ============================================================
+        # Robot1
+        # ============================================================
+
         self.robot1 = RobotPathTracker(
             robot_id=1,
-
             robot_name=robot1_name,
-
             other_robot_name=robot2_name,
 
             path_topic=rospy.get_param(
@@ -2571,14 +2402,12 @@ class DualRobotPathController:
         )
 
         # ============================================================
-        # Robot 2
+        # Robot2
         # ============================================================
 
         self.robot2 = RobotPathTracker(
             robot_id=2,
-
             robot_name=robot2_name,
-
             other_robot_name=robot1_name,
 
             path_topic=rospy.get_param(
@@ -2610,8 +2439,7 @@ class DualRobotPathController:
 
         self.timer = rospy.Timer(
             rospy.Duration(
-                1.0
-                /
+                1.0 /
                 max(
                     frequency,
                     1e-6
@@ -2624,10 +2452,6 @@ class DualRobotPathController:
             self.shutdown
         )
 
-        # ============================================================
-        # Log
-        # ============================================================
-
         rospy.loginfo(
             "=========================================="
         )
@@ -2637,22 +2461,8 @@ class DualRobotPathController:
         )
 
         rospy.loginfo(
-            "=========================================="
-        )
-
-        rospy.loginfo(
             "Control frequency: %.1f Hz",
             frequency
-        )
-
-        rospy.loginfo(
-            "Robot1: %s",
-            self.robot1.robot_name
-        )
-
-        rospy.loginfo(
-            "Robot2: %s",
-            self.robot2.robot_name
         )
 
         rospy.loginfo(
@@ -2660,7 +2470,7 @@ class DualRobotPathController:
         )
 
     # =================================================================
-    # Control callback
+    # Timer
     # =================================================================
 
     def control_callback(self, event):
@@ -2669,15 +2479,7 @@ class DualRobotPathController:
 
             return
 
-        # ------------------------------------------------------------
-        # Robot1
-        # ------------------------------------------------------------
-
         self.robot1.control()
-
-        # ------------------------------------------------------------
-        # Robot2
-        # ------------------------------------------------------------
 
         self.robot2.control()
 
@@ -2688,7 +2490,7 @@ class DualRobotPathController:
     def shutdown(self):
 
         rospy.loginfo(
-            "Stopping both robots..."
+            "Stopping both robots."
         )
 
         self.robot1.stop()
@@ -2714,6 +2516,10 @@ def main():
 
         pass
 
+
+# =====================================================================
+# Entry
+# =====================================================================
 
 if __name__ == "__main__":
 
