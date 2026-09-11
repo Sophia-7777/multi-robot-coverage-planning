@@ -36,6 +36,10 @@ rosrun multi_robot_sim coverage_space+free_space.py
 
 rosrun multi_robot_sim region_allocator.py
 
+rosrun multi_robot_sim coverage_path.py
+
+rosrun multi_robot_sim coverage_path_controller.py
+
 
 rosrun tf view_frames（查看tf）
 

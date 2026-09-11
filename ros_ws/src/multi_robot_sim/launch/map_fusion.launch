@@ -25,10 +25,10 @@
                value="global_map"/>
 
         <param name="map_topic_1"
-               value="/robot1/map"/>
+               value="/robot1/map_processed"/>
 
         <param name="map_topic_2"
-               value="/robot2/map"/>
+               value="/robot2/map_processed"/>
 
         <param name="output_topic"
                value="/global_map"/>

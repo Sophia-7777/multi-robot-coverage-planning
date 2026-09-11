@@ -77,12 +77,12 @@ class RealTimeMapFusion:
 
         self.robot1_map_frame = rospy.get_param(
             "~robot1_map_frame",
-            "robot1/map"
+            "robot1/map_processed"
         )
 
         self.robot2_map_frame = rospy.get_param(
             "~robot2_map_frame",
-            "robot2/map"
+            "robot2/map_processed"
         )
 
         self.robot1_base_frame = rospy.get_param(
@@ -102,12 +102,12 @@ class RealTimeMapFusion:
 
         self.map_topic_1 = rospy.get_param(
             "~map_topic_1",
-            "/robot1/map"
+            "/robot1/map_processed"
         )
 
         self.map_topic_2 = rospy.get_param(
             "~map_topic_2",
-            "/robot2/map"
+            "/robot2/map_processed"
         )
 
         self.output_topic = rospy.get_param(
