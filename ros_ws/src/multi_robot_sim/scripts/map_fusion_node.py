@@ -45,14 +45,47 @@ class RealTimeMapFusion:
 
     Gazebo ground truth is only used to initialize the map alignment.
 
-    This is suitable for simulation testing.
+    Current version additionally performs:
 
-    For real robots, the Gazebo section can later be replaced by:
-        - map matching
-        - scan matching
-        - ICP
-        - feature matching
-        - pose graph optimization
+        Robot1 map
+             +
+        Robot2 map
+             |
+             v
+        current global_map
+             |
+             OR
+             |
+        previous global_map
+             |
+             v
+        final global_map
+
+
+    OR fusion rule:
+
+        -1 + -1   -> -1
+        -1 + 0    -> 0
+         0 + -1  -> 0
+         0 + 0   -> 0
+
+        -1 + 100  -> 100
+        100 + -1  -> 100
+        100 + 100 -> 100
+
+         0 + 100  -> 0
+        100 + 0   -> 0
+
+
+    Priority:
+
+        0 > 100 > -1
+
+
+    Performance:
+        Map insertion and previous-map fusion are implemented
+        using NumPy vectorized operations instead of Python
+        per-cell nested loops.
     """
 
     def __init__(self):
@@ -139,6 +172,12 @@ class RealTimeMapFusion:
 
         self.robot1_world_pose = None
         self.robot2_world_pose = None
+
+        # ============================================================
+        # Previous global map
+        # ============================================================
+
+        self.previous_global_map = None
 
         self.lock = threading.Lock()
 
@@ -252,6 +291,14 @@ class RealTimeMapFusion:
         rospy.loginfo(
             "Global frame  : %s",
             self.global_frame
+        )
+
+        rospy.loginfo(
+            "Previous global_map OR fusion: ENABLED"
+        )
+
+        rospy.loginfo(
+            "NumPy vectorized fusion: ENABLED"
         )
 
         rospy.loginfo(
@@ -728,35 +775,6 @@ class RealTimeMapFusion:
         )
 
     # ================================================================
-    # Transform point
-    # ================================================================
-
-    @staticmethod
-    def transform_point(
-        x,
-        y,
-        T
-    ):
-
-        p = np.array(
-            [
-                x,
-                y,
-                1.0
-            ]
-        )
-
-        p_global = np.matmul(
-            T,
-            p
-        )
-
-        return (
-            float(p_global[0]),
-            float(p_global[1])
-        )
-
-    # ================================================================
     # Map origin transform
     # ================================================================
 
@@ -793,10 +811,6 @@ class RealTimeMapFusion:
         width = map_msg.info.width
         height = map_msg.info.height
 
-        # ------------------------------------------------------------
-        # Map origin
-        # ------------------------------------------------------------
-
         T_map_origin = self.map_origin_matrix(
             map_msg
         )
@@ -804,45 +818,35 @@ class RealTimeMapFusion:
         width_m = width * resolution
         height_m = height * resolution
 
-        local_corners = [
-            (0.0, 0.0),
-            (width_m, 0.0),
-            (0.0, height_m),
-            (width_m, height_m)
+        local_corners = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [width_m, 0.0, 1.0],
+                [0.0, height_m, 1.0],
+                [width_m, height_m, 1.0]
+            ],
+            dtype=np.float64
+        )
+
+        # map-local -> map
+        p_map = (
+            T_map_origin @
+            local_corners.T
+        )
+
+        # map -> global
+        p_global = (
+            T_global_map @
+            p_map
+        )
+
+        return [
+            (
+                float(p_global[0, i]),
+                float(p_global[1, i])
+            )
+            for i in range(4)
         ]
-
-        result = []
-
-        for x, y in local_corners:
-
-            point = np.array(
-                [
-                    x,
-                    y,
-                    1.0
-                ]
-            )
-
-            # map-local -> map
-            p_map = np.matmul(
-                T_map_origin,
-                point
-            )
-
-            # map -> global
-            p_global = np.matmul(
-                T_global_map,
-                p_map
-            )
-
-            result.append(
-                (
-                    float(p_global[0]),
-                    float(p_global[1])
-                )
-            )
-
-        return result
 
     # ================================================================
     # Calculate global bounds
@@ -871,35 +875,23 @@ class RealTimeMapFusion:
             corners2
         )
 
-        min_x = min(
-            p[0]
-            for p in all_corners
+        xs = np.array(
+            [p[0] for p in all_corners]
         )
 
-        max_x = max(
-            p[0]
-            for p in all_corners
-        )
-
-        min_y = min(
-            p[1]
-            for p in all_corners
-        )
-
-        max_y = max(
-            p[1]
-            for p in all_corners
+        ys = np.array(
+            [p[1] for p in all_corners]
         )
 
         return (
-            min_x,
-            max_x,
-            min_y,
-            max_y
+            float(np.min(xs)),
+            float(np.max(xs)),
+            float(np.min(ys)),
+            float(np.max(ys))
         )
 
     # ================================================================
-    # Insert map
+    # Insert map - NumPy vectorized version
     # ================================================================
 
     def insert_map(
@@ -912,11 +904,27 @@ class RealTimeMapFusion:
         source_map,
         T_global_map
     ):
+        """
+        Insert source OccupancyGrid into global_grid.
+
+        This version avoids Python nested loops.
+
+        The complete map is transformed using NumPy matrix
+        operations.
+
+        Fusion priority:
+
+            0 > 100 > intermediate > -1
+        """
 
         resolution = source_map.info.resolution
 
         width = source_map.info.width
         height = source_map.info.height
+
+        # ------------------------------------------------------------
+        # Source map
+        # ------------------------------------------------------------
 
         source_data = np.asarray(
             source_map.data,
@@ -935,165 +943,319 @@ class RealTimeMapFusion:
         )
 
         # ------------------------------------------------------------
-        # Iterate through source map
+        # Generate all cell centers
+        #
+        # Shape:
+        #     X -> (height, width)
+        #     Y -> (height, width)
         # ------------------------------------------------------------
 
-        for row in range(height):
+        cols = (
+            np.arange(
+                width,
+                dtype=np.float64
+            )
+            + 0.5
+        )
 
-            for col in range(width):
+        rows = (
+            np.arange(
+                height,
+                dtype=np.float64
+            )
+            + 0.5
+        )
 
-                value = source_data[
-                    row,
-                    col
+        local_x = cols * resolution
+        local_y = rows * resolution
+
+        local_x, local_y = np.meshgrid(
+            local_x,
+            local_y
+        )
+
+        # ------------------------------------------------------------
+        # Flatten
+        # ------------------------------------------------------------
+
+        x = local_x.ravel()
+        y = local_y.ravel()
+
+        values = source_data.ravel()
+
+        # ------------------------------------------------------------
+        # Remove unknown cells
+        #
+        # Unknown (-1) does not need to be inserted.
+        # ------------------------------------------------------------
+
+        valid = (
+            values >= 0
+        )
+
+        if not np.any(valid):
+
+            return
+
+        x = x[valid]
+        y = y[valid]
+        values = values[valid]
+
+        # ------------------------------------------------------------
+        # map-local -> map
+        #
+        # Since this is 2D homogeneous transformation:
+        #
+        # x' = R00*x + R01*y + tx
+        # y' = R10*x + R11*y + ty
+        # ------------------------------------------------------------
+
+        map_x = (
+            T_map_origin[0, 0] * x
+            +
+            T_map_origin[0, 1] * y
+            +
+            T_map_origin[0, 2]
+        )
+
+        map_y = (
+            T_map_origin[1, 0] * x
+            +
+            T_map_origin[1, 1] * y
+            +
+            T_map_origin[1, 2]
+        )
+
+        # ------------------------------------------------------------
+        # map -> global
+        # ------------------------------------------------------------
+
+        global_x = (
+            T_global_map[0, 0] * map_x
+            +
+            T_global_map[0, 1] * map_y
+            +
+            T_global_map[0, 2]
+        )
+
+        global_y = (
+            T_global_map[1, 0] * map_x
+            +
+            T_global_map[1, 1] * map_y
+            +
+            T_global_map[1, 2]
+        )
+
+        # ------------------------------------------------------------
+        # global -> grid cell
+        # ------------------------------------------------------------
+
+        global_cols = np.floor(
+            (
+                global_x -
+                global_origin_x
+            ) / resolution
+        ).astype(
+            np.int32
+        )
+
+        global_rows = np.floor(
+            (
+                global_y -
+                global_origin_y
+            ) / resolution
+        ).astype(
+            np.int32
+        )
+
+        # ------------------------------------------------------------
+        # Remove points outside global grid
+        # ------------------------------------------------------------
+
+        inside = (
+            (global_cols >= 0)
+            &
+            (global_cols < global_width)
+            &
+            (global_rows >= 0)
+            &
+            (global_rows < global_height)
+        )
+
+        if not np.any(inside):
+
+            return
+
+        global_cols = global_cols[inside]
+        global_rows = global_rows[inside]
+        values = values[inside]
+
+        # ------------------------------------------------------------
+        # Existing values
+        # ------------------------------------------------------------
+
+        old_values = global_grid[
+            global_rows,
+            global_cols
+        ]
+
+        # ============================================================
+        # Fusion
+        #
+        # Priority:
+        #
+        #     0 > 100 > intermediate > -1
+        #
+        # ============================================================
+
+        # ------------------------------------------------------------
+        # Source free
+        #
+        # Free has highest priority.
+        # ------------------------------------------------------------
+
+        source_free = (
+            values <= self.free_threshold
+        )
+
+        if np.any(source_free):
+
+            rows_free = global_rows[
+                source_free
+            ]
+
+            cols_free = global_cols[
+                source_free
+            ]
+
+            global_grid[
+                rows_free,
+                cols_free
+            ] = 0
+
+        # ------------------------------------------------------------
+        # Source occupied
+        #
+        # If old is already free, keep free.
+        # Otherwise occupied becomes 100.
+        # ------------------------------------------------------------
+
+        source_occupied = (
+            values >= self.occupied_threshold
+        )
+
+        if np.any(source_occupied):
+
+            rows_occ = global_rows[
+                source_occupied
+            ]
+
+            cols_occ = global_cols[
+                source_occupied
+            ]
+
+            old_occ = global_grid[
+                rows_occ,
+                cols_occ
+            ]
+
+            occupied_result = np.where(
+                old_occ == 0,
+                0,
+                100
+            )
+
+            global_grid[
+                rows_occ,
+                cols_occ
+            ] = occupied_result
+
+        # ------------------------------------------------------------
+        # Intermediate probability
+        # ------------------------------------------------------------
+
+        source_intermediate = (
+            (~source_free)
+            &
+            (~source_occupied)
+        )
+
+        if np.any(source_intermediate):
+
+            rows_mid = global_rows[
+                source_intermediate
+            ]
+
+            cols_mid = global_cols[
+                source_intermediate
+            ]
+
+            values_mid = values[
+                source_intermediate
+            ]
+
+            old_mid = global_grid[
+                rows_mid,
+                cols_mid
+            ]
+
+            # Existing free remains free.
+            free_mask = (
+                old_mid == 0
+            )
+
+            # Existing occupied remains occupied.
+            occupied_mask = (
+                old_mid == 100
+            )
+
+            # Unknown gets source value.
+            unknown_mask = (
+                old_mid < 0
+            )
+
+            # Existing intermediate values:
+            # keep the larger probability.
+            intermediate_mask = (
+                (~free_mask)
+                &
+                (~occupied_mask)
+                &
+                (~unknown_mask)
+            )
+
+            # Unknown
+            if np.any(unknown_mask):
+
+                global_grid[
+                    rows_mid[unknown_mask],
+                    cols_mid[unknown_mask]
+                ] = values_mid[
+                    unknown_mask
                 ]
 
-                # ----------------------------------------------------
-                # Unknown
-                # ----------------------------------------------------
+            # Intermediate
+            if np.any(intermediate_mask):
 
-                if value < 0:
+                current_values = global_grid[
+                    rows_mid[intermediate_mask],
+                    cols_mid[intermediate_mask]
+                ]
 
-                    continue
-
-                # ----------------------------------------------------
-                # Cell center in map-local coordinates
-                # ----------------------------------------------------
-
-                local_x = (
-                    (col + 0.5)
-                    * resolution
-                )
-
-                local_y = (
-                    (row + 0.5)
-                    * resolution
-                )
-
-                p_local = np.array(
-                    [
-                        local_x,
-                        local_y,
-                        1.0
+                new_values = np.maximum(
+                    current_values,
+                    values_mid[
+                        intermediate_mask
                     ]
                 )
 
-                # ----------------------------------------------------
-                # map-local -> map
-                # ----------------------------------------------------
-
-                p_map = np.matmul(
-                    T_map_origin,
-                    p_local
-                )
-
-                # ----------------------------------------------------
-                # map -> global
-                # ----------------------------------------------------
-
-                p_global = np.matmul(
-                    T_global_map,
-                    p_map
-                )
-
-                global_x = p_global[0]
-                global_y = p_global[1]
-
-                # ----------------------------------------------------
-                # global -> cell
-                # ----------------------------------------------------
-
-                global_col = int(
-                    math.floor(
-                        (
-                            global_x -
-                            global_origin_x
-                        )
-                        / resolution
-                    )
-                )
-
-                global_row = int(
-                    math.floor(
-                        (
-                            global_y -
-                            global_origin_y
-                        )
-                        / resolution
-                    )
-                )
-
-                if (
-                    global_col < 0
-                    or
-                    global_col >= global_width
-                    or
-                    global_row < 0
-                    or
-                    global_row >= global_height
-                ):
-
-                    continue
-
-                old_value = global_grid[
-                    global_row,
-                    global_col
-                ]
-
-                # ====================================================
-                # Occupied
-                # ====================================================
-
-                if value >= self.occupied_threshold:
-
-                    global_grid[
-                        global_row,
-                        global_col
-                    ] = 100
-
-                    continue
-
-                # ====================================================
-                # Free
-                # ====================================================
-
-                if value <= self.free_threshold:
-
-                    if old_value < 0:
-
-                        global_grid[
-                            global_row,
-                            global_col
-                        ] = 0
-
-                    elif old_value <= self.free_threshold:
-
-                        global_grid[
-                            global_row,
-                            global_col
-                        ] = 0
-
-                    continue
-
-                # ====================================================
-                # Intermediate probability
-                # ====================================================
-
-                if old_value < 0:
-
-                    global_grid[
-                        global_row,
-                        global_col
-                    ] = value
-
-                elif value > old_value:
-
-                    global_grid[
-                        global_row,
-                        global_col
-                    ] = value
+                global_grid[
+                    rows_mid[intermediate_mask],
+                    cols_mid[intermediate_mask]
+                ] = new_values
 
     # ================================================================
-    # Fuse maps
+    # Fuse Robot 1 + Robot 2
     # ================================================================
 
     def fuse_maps(
@@ -1300,6 +1462,521 @@ class RealTimeMapFusion:
         return msg
 
     # ================================================================
+    # OR current global_map with previous global_map
+    # ================================================================
+
+    def merge_global_maps(
+        self,
+        previous_map,
+        current_map
+    ):
+        """
+        Vectorized previous/current global_map fusion.
+
+        Priority:
+
+            0 > 100 > -1
+
+        No Python per-cell nested loop.
+        """
+
+        # ============================================================
+        # First global_map
+        # ============================================================
+
+        if previous_map is None:
+
+            return current_map
+
+        # ============================================================
+        # Check resolution
+        # ============================================================
+
+        previous_resolution = (
+            previous_map.info.resolution
+        )
+
+        current_resolution = (
+            current_map.info.resolution
+        )
+
+        if abs(
+            previous_resolution
+            -
+            current_resolution
+        ) > 1e-6:
+
+            rospy.logwarn_throttle(
+                5.0,
+                "Previous/current global_map resolution "
+                "is different."
+            )
+
+            return current_map
+
+        resolution = current_resolution
+
+        # ============================================================
+        # Current map information
+        # ============================================================
+
+        current_width = current_map.info.width
+        current_height = current_map.info.height
+
+        current_origin_x = (
+            current_map.info.origin.position.x
+        )
+
+        current_origin_y = (
+            current_map.info.origin.position.y
+        )
+
+        current_data = np.asarray(
+            current_map.data,
+            dtype=np.int16
+        ).reshape(
+            current_height,
+            current_width
+        )
+
+        # ============================================================
+        # Previous map information
+        # ============================================================
+
+        previous_width = previous_map.info.width
+        previous_height = previous_map.info.height
+
+        previous_origin_x = (
+            previous_map.info.origin.position.x
+        )
+
+        previous_origin_y = (
+            previous_map.info.origin.position.y
+        )
+
+        previous_data = np.asarray(
+            previous_map.data,
+            dtype=np.int16
+        ).reshape(
+            previous_height,
+            previous_width
+        )
+
+        # ============================================================
+        # Result starts from current map
+        # ============================================================
+
+        result = current_data.copy()
+
+        # ============================================================
+        # Calculate previous map bounds
+        # ============================================================
+
+        previous_max_x = (
+            previous_origin_x
+            +
+            previous_width * resolution
+        )
+
+        previous_max_y = (
+            previous_origin_y
+            +
+            previous_height * resolution
+        )
+
+        # ============================================================
+        # Current map bounds
+        # ============================================================
+
+        current_max_x = (
+            current_origin_x
+            +
+            current_width * resolution
+        )
+
+        current_max_y = (
+            current_origin_y
+            +
+            current_height * resolution
+        )
+
+        # ============================================================
+        # Overlap
+        # ============================================================
+
+        overlap_min_x = max(
+            previous_origin_x,
+            current_origin_x
+        )
+
+        overlap_max_x = min(
+            previous_max_x,
+            current_max_x
+        )
+
+        overlap_min_y = max(
+            previous_origin_y,
+            current_origin_y
+        )
+
+        overlap_max_y = min(
+            previous_max_y,
+            current_max_y
+        )
+
+        # ============================================================
+        # No overlap
+        # ============================================================
+
+        if (
+            overlap_min_x >= overlap_max_x
+            or
+            overlap_min_y >= overlap_max_y
+        ):
+
+            rospy.logwarn_throttle(
+                5.0,
+                "Previous and current global_map "
+                "have no spatial overlap."
+            )
+
+            return current_map
+
+        # ============================================================
+        # Current row range
+        # ============================================================
+
+        current_row_start = max(
+            0,
+            int(
+                math.floor(
+                    (
+                        overlap_min_y
+                        -
+                        current_origin_y
+                    )
+                    / resolution
+                )
+            )
+        )
+
+        current_row_end = min(
+            current_height,
+            int(
+                math.ceil(
+                    (
+                        overlap_max_y
+                        -
+                        current_origin_y
+                    )
+                    / resolution
+                )
+            )
+        )
+
+        # ============================================================
+        # Current column range
+        # ============================================================
+
+        current_col_start = max(
+            0,
+            int(
+                math.floor(
+                    (
+                        overlap_min_x
+                        -
+                        current_origin_x
+                    )
+                    / resolution
+                )
+            )
+        )
+
+        current_col_end = min(
+            current_width,
+            int(
+                math.ceil(
+                    (
+                        overlap_max_x
+                        -
+                        current_origin_x
+                    )
+                    / resolution
+                )
+            )
+        )
+
+        if (
+            current_row_start >= current_row_end
+            or
+            current_col_start >= current_col_end
+        ):
+
+            return current_map
+
+        # ============================================================
+        # Generate current-grid coordinates
+        #
+        # No Python nested loop.
+        # ============================================================
+
+        current_rows = np.arange(
+            current_row_start,
+            current_row_end,
+            dtype=np.int32
+        )
+
+        current_cols = np.arange(
+            current_col_start,
+            current_col_end,
+            dtype=np.int32
+        )
+
+        # ------------------------------------------------------------
+        # Global coordinate of cell centers
+        # ------------------------------------------------------------
+
+        global_y = (
+            current_origin_y
+            +
+            (current_rows.astype(np.float64) + 0.5)
+            * resolution
+        )
+
+        global_x = (
+            current_origin_x
+            +
+            (current_cols.astype(np.float64) + 0.5)
+            * resolution
+        )
+
+        # ------------------------------------------------------------
+        # Corresponding previous indices
+        # ------------------------------------------------------------
+
+        previous_rows = np.floor(
+            (
+                global_y
+                -
+                previous_origin_y
+            )
+            / resolution
+        ).astype(
+            np.int32
+        )
+
+        previous_cols = np.floor(
+            (
+                global_x
+                -
+                previous_origin_x
+            )
+            / resolution
+        ).astype(
+            np.int32
+        )
+
+        # ============================================================
+        # Safety clipping
+        # ============================================================
+
+        valid_rows = (
+            (previous_rows >= 0)
+            &
+            (previous_rows < previous_height)
+        )
+
+        valid_cols = (
+            (previous_cols >= 0)
+            &
+            (previous_cols < previous_width)
+        )
+
+        if (
+            not np.any(valid_rows)
+            or
+            not np.any(valid_cols)
+        ):
+
+            return current_map
+
+        # ============================================================
+        # Since map resolution and origins are aligned,
+        # the valid overlap is rectangular.
+        #
+        # Use the valid index ranges directly.
+        # ============================================================
+
+        current_rows_valid = (
+            current_rows[valid_rows]
+        )
+
+        previous_rows_valid = (
+            previous_rows[valid_rows]
+        )
+
+        current_cols_valid = (
+            current_cols[valid_cols]
+        )
+
+        previous_cols_valid = (
+            previous_cols[valid_cols]
+        )
+
+        # ============================================================
+        # Extract previous/current overlap
+        # ============================================================
+
+        current_overlap = result[
+            np.ix_(
+                current_rows_valid,
+                current_cols_valid
+            )
+        ]
+
+        previous_overlap = previous_data[
+            np.ix_(
+                previous_rows_valid,
+                previous_cols_valid
+            )
+        ]
+
+        # ============================================================
+        # OR fusion
+        #
+        # Priority:
+        #
+        #       0 > 100 > -1
+        #
+        # ============================================================
+
+        # ------------------------------------------------------------
+        # Free
+        #
+        # If either map is 0 -> 0
+        # ------------------------------------------------------------
+
+        free_mask = (
+            (current_overlap == 0)
+            |
+            (previous_overlap == 0)
+        )
+
+        # ------------------------------------------------------------
+        # Occupied
+        #
+        # If no free exists and either map is 100 -> 100
+        # ------------------------------------------------------------
+
+        occupied_mask = (
+            (~free_mask)
+            &
+            (
+                (current_overlap == 100)
+                |
+                (previous_overlap == 100)
+            )
+        )
+
+        # ------------------------------------------------------------
+        # Unknown / intermediate
+        # ------------------------------------------------------------
+
+        intermediate_mask = (
+            (~free_mask)
+            &
+            (~occupied_mask)
+        )
+
+        # ------------------------------------------------------------
+        # Build merged result
+        # ------------------------------------------------------------
+
+        merged_overlap = current_overlap.copy()
+
+        # Free
+        merged_overlap[
+            free_mask
+        ] = 0
+
+        # Occupied
+        merged_overlap[
+            occupied_mask
+        ] = 100
+
+        # Remaining:
+        #
+        # -1 + -1 -> -1
+        # -1 + value -> value
+        # value + -1 -> value
+        # value + value -> max(value)
+        #
+        if np.any(intermediate_mask):
+
+            current_remaining = (
+                current_overlap[
+                    intermediate_mask
+                ]
+            )
+
+            previous_remaining = (
+                previous_overlap[
+                    intermediate_mask
+                ]
+            )
+
+            merged_remaining = np.where(
+                current_remaining < 0,
+                previous_remaining,
+                np.where(
+                    previous_remaining < 0,
+                    current_remaining,
+                    np.maximum(
+                        current_remaining,
+                        previous_remaining
+                    )
+                )
+            )
+
+            merged_overlap[
+                intermediate_mask
+            ] = merged_remaining
+
+        # ============================================================
+        # Write back
+        # ============================================================
+
+        result[
+            np.ix_(
+                current_rows_valid,
+                current_cols_valid
+            )
+        ] = merged_overlap
+
+        # ============================================================
+        # Create merged OccupancyGrid
+        # ============================================================
+
+        merged_map = OccupancyGrid()
+
+        merged_map.header.stamp = rospy.Time.now()
+
+        merged_map.header.frame_id = (
+            current_map.header.frame_id
+        )
+
+        merged_map.info = current_map.info
+
+        merged_map.data = (
+            result
+            .flatten()
+            .astype(np.int8)
+            .tolist()
+        )
+
+        return merged_map
+
+    # ================================================================
     # Main timer
     # ================================================================
 
@@ -1360,31 +2037,62 @@ class RealTimeMapFusion:
         self.publish_map_tfs()
 
         # ------------------------------------------------------------
-        # Fuse
+        # Fuse Robot1 + Robot2
         # ------------------------------------------------------------
 
-        global_map = self.fuse_maps(
+        current_global_map = self.fuse_maps(
             map1,
             map2
         )
 
-        if global_map is None:
+        if current_global_map is None:
 
             return
+
+        # ============================================================
+        # OR current global_map with previous global_map
+        # ============================================================
+
+        with self.lock:
+
+            previous_global_map = (
+                self.previous_global_map
+            )
+
+        final_global_map = (
+            self.merge_global_maps(
+                previous_global_map,
+                current_global_map
+            )
+        )
+
+        if final_global_map is None:
+
+            return
+
+        # ============================================================
+        # Save final global_map as previous global_map
+        # ============================================================
+
+        with self.lock:
+
+            self.previous_global_map = (
+                final_global_map
+            )
 
         # ------------------------------------------------------------
         # Publish
         # ------------------------------------------------------------
 
         self.global_map_pub.publish(
-            global_map
+            final_global_map
         )
 
         rospy.loginfo_throttle(
             5.0,
             "Global map published: %d x %d",
-            global_map.info.width,
-            global_map.info.height
+            final_global_map.info.width,
+            final_global_map.info.height
         )
 
 
@@ -1408,3 +2116,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+

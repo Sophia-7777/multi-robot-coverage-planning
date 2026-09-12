@@ -15,27 +15,46 @@ class RegionAllocator:
 
     根据 /covered_map 对两个机器人进行区域分配。
 
-    covered_map 的数据定义：
+    covered_map：
+
         -1 : 非自由区域 / 未知区域
          0 : 未覆盖的自由区域 -> 需要进行任务分配
        100 : 已覆盖的自由区域 -> 不作为任务分配区域
 
-    分配策略：
-        1. 只有 covered_map == 0 的区域最终会被分配
-        2. covered_map == 100 的区域不会产生任务
-        3. 但是 100 区域允许作为机器人移动/传播路径
-        4. 使用多源 Dijkstra，根据机器人到各任务单元的栅格距离进行划分
-        5. 两个机器人分别得到自己的区域
+    分配规则：
+
+        1. 只有 covered_map == 0 的区域最终成为任务。
+
+        2. covered_map == 100 不产生任务。
+
+        3. covered_map == 100 可以作为机器人移动 /
+           Dijkstra 传播路径。
+
+        4. covered_map == -1 不允许传播。
+
+        5. 最终 region_map 中：
+
+               -1 -> 非任务区域
+                0 -> Robot1 任务
+              100 -> Robot2 任务
+
+        6. robot1_region / robot2_region：
+
+               100 -> 自己的任务
+                 0 -> 对方的任务
+                -1 -> 非任务区域
     """
 
     def __init__(self):
-        rospy.init_node("region_allocator_node")
+
+        rospy.init_node(
+            "region_allocator_node"
+        )
 
         # ============================================================
         # Parameters
         # ============================================================
 
-        # 地图 topic
         self.covered_map_topic = rospy.get_param(
             "~covered_map_topic",
             "/covered_map"
@@ -56,7 +75,6 @@ class RegionAllocator:
             "/robot2_region"
         )
 
-        # 机器人名称
         self.robot1_name = rospy.get_param(
             "~robot1_name",
             "robot1"
@@ -67,28 +85,29 @@ class RegionAllocator:
             "robot2"
         )
 
-        # 更新频率
         self.update_rate = rospy.get_param(
             "~update_rate",
             1.0
         )
 
-        # 是否根据机器人移动重新分配
         self.reallocate_on_robot_move = rospy.get_param(
             "~reallocate_on_robot_move",
             True
         )
 
-        # 机器人移动多少距离后重新分配
         self.min_robot_move = rospy.get_param(
             "~min_robot_move",
             0.5
         )
 
-        # 障碍物膨胀半径
         self.inflation_radius = rospy.get_param(
             "~inflation_radius",
             0.30
+        )
+
+        self.covered_inflation_radius = rospy.get_param(
+            "~covered_inflation_radius",
+            0.50
         )
 
         # ============================================================
@@ -153,34 +172,95 @@ class RegionAllocator:
         # ============================================================
 
         self.timer = rospy.Timer(
-            rospy.Duration(1.0 / self.update_rate),
+            rospy.Duration(
+                1.0 /
+                max(
+                    self.update_rate,
+                    1e-6
+                )
+            ),
             self.timer_callback
         )
 
-        rospy.loginfo("==============================================")
-        rospy.loginfo(" Region Allocator Started")
-        rospy.loginfo("==============================================")
-        rospy.loginfo("covered_map topic : %s", self.covered_map_topic)
-        rospy.loginfo("region_map topic  : %s", self.region_map_topic)
-        rospy.loginfo("robot1            : %s", self.robot1_name)
-        rospy.loginfo("robot2            : %s", self.robot2_name)
-        rospy.loginfo("update rate       : %.2f Hz", self.update_rate)
-        rospy.loginfo("inflation radius  : %.2f m", self.inflation_radius)
-        rospy.loginfo("----------------------------------------------")
-        rospy.loginfo("Allocation rule:")
-        rospy.loginfo("  covered_map == 0   -> TASK")
-        rospy.loginfo("  covered_map == 100 -> ALREADY COVERED")
-        rospy.loginfo("  covered_map == -1  -> NON-FREE")
-        rospy.loginfo("==============================================")
+        rospy.loginfo(
+            "=============================================="
+        )
+
+        rospy.loginfo(
+            " Region Allocator Started"
+        )
+
+        rospy.loginfo(
+            "=============================================="
+        )
+
+        rospy.loginfo(
+            "covered_map topic : %s",
+            self.covered_map_topic
+        )
+
+        rospy.loginfo(
+            "region_map topic  : %s",
+            self.region_map_topic
+        )
+
+        rospy.loginfo(
+            "robot1            : %s",
+            self.robot1_name
+        )
+
+        rospy.loginfo(
+            "robot2            : %s",
+            self.robot2_name
+        )
+
+        rospy.loginfo(
+            "update rate       : %.2f Hz",
+            self.update_rate
+        )
+
+        rospy.loginfo(
+            "inflation radius  : %.2f m",
+            self.inflation_radius
+        )
+
+        rospy.loginfo(
+            "covered inflation : %.2f m",
+            self.covered_inflation_radius
+        )
+
+        rospy.loginfo(
+            "----------------------------------------------"
+        )
+
+        rospy.loginfo(
+            "Allocation rule:"
+        )
+
+        rospy.loginfo(
+            "  covered_map == 0   -> TASK"
+        )
+
+        rospy.loginfo(
+            "  covered_map == 100 -> TRAVERSABLE / NO TASK"
+        )
+
+        rospy.loginfo(
+            "  covered_map == -1  -> NON-FREE"
+        )
+
+        rospy.loginfo(
+            "=============================================="
+        )
 
     # ================================================================
     # Callback: covered map
     # ================================================================
 
-    def covered_map_callback(self, msg):
-        """
-        保存最新 covered_map
-        """
+    def covered_map_callback(
+        self,
+        msg
+    ):
 
         self.covered_map = msg
 
@@ -190,14 +270,20 @@ class RegionAllocator:
     # Callback: Gazebo model states
     # ================================================================
 
-    def model_states_callback(self, msg):
-        """
-        从 Gazebo ModelStates 中获取两个机器人位置
-        """
+    def model_states_callback(
+        self,
+        msg
+    ):
 
-        # robot1
+        # ------------------------------------------------------------
+        # Robot 1
+        # ------------------------------------------------------------
+
         if self.robot1_name in msg.name:
-            idx = msg.name.index(self.robot1_name)
+
+            idx = msg.name.index(
+                self.robot1_name
+            )
 
             pose = msg.pose[idx]
 
@@ -206,9 +292,15 @@ class RegionAllocator:
                 pose.position.y
             )
 
-        # robot2
+        # ------------------------------------------------------------
+        # Robot 2
+        # ------------------------------------------------------------
+
         if self.robot2_name in msg.name:
-            idx = msg.name.index(self.robot2_name)
+
+            idx = msg.name.index(
+                self.robot2_name
+            )
 
             pose = msg.pose[idx]
 
@@ -221,46 +313,62 @@ class RegionAllocator:
     # Timer callback
     # ================================================================
 
-    def timer_callback(self, event):
-        """
-        定期检查是否需要进行区域重新分配
-        """
+    def timer_callback(
+        self,
+        event
+    ):
 
         if self.covered_map is None:
+
             rospy.logwarn_throttle(
                 5.0,
                 "Waiting for covered_map..."
             )
+
             return
 
         if self.robot1_pose is None:
+
             rospy.logwarn_throttle(
                 5.0,
                 "Waiting for robot1 pose..."
             )
+
             return
 
         if self.robot2_pose is None:
+
             rospy.logwarn_throttle(
                 5.0,
                 "Waiting for robot2 pose..."
             )
+
             return
 
         # ============================================================
         # 第一次运行
         # ============================================================
 
-        if self.last_robot1_pose is None or self.last_robot2_pose is None:
+        if (
+            self.last_robot1_pose is None
+            or
+            self.last_robot2_pose is None
+        ):
 
             rospy.loginfo(
-                "Initial robot positions received, allocating regions..."
+                "Initial robot positions received, "
+                "allocating regions..."
             )
 
             self.allocate()
 
-            self.last_robot1_pose = self.robot1_pose
-            self.last_robot2_pose = self.robot2_pose
+            self.last_robot1_pose = (
+                self.robot1_pose
+            )
+
+            self.last_robot2_pose = (
+                self.robot2_pose
+            )
 
             return
 
@@ -287,7 +395,9 @@ class RegionAllocator:
             ):
 
                 rospy.loginfo(
-                    "Robot moved: robot1=%.2f m, robot2=%.2f m. "
+                    "Robot moved: "
+                    "robot1=%.2f m, "
+                    "robot2=%.2f m. "
                     "Reallocating...",
                     robot1_moved,
                     robot2_moved
@@ -295,17 +405,23 @@ class RegionAllocator:
 
                 self.allocate()
 
-                self.last_robot1_pose = self.robot1_pose
-                self.last_robot2_pose = self.robot2_pose
+                self.last_robot1_pose = (
+                    self.robot1_pose
+                )
+
+                self.last_robot2_pose = (
+                    self.robot2_pose
+                )
 
     # ================================================================
     # Distance
     # ================================================================
 
-    def distance(self, p1, p2):
-        """
-        计算两个二维坐标之间的欧氏距离
-        """
+    @staticmethod
+    def distance(
+        p1,
+        p2
+    ):
 
         if p1 is None or p2 is None:
             return float("inf")
@@ -313,18 +429,27 @@ class RegionAllocator:
         dx = p1[0] - p2[0]
         dy = p1[1] - p2[1]
 
-        return np.sqrt(dx * dx + dy * dy)
+        return np.sqrt(
+            dx * dx
+            +
+            dy * dy
+        )
 
     # ================================================================
     # World -> Grid
     # ================================================================
 
-    def world_to_grid(self, x, y, map_msg):
+    def world_to_grid(
+        self,
+        x,
+        y,
+        map_msg
+    ):
         """
-        世界坐标 -> 栅格坐标
+        返回：
 
-        注意：
-        必须考虑 OccupancyGrid 的 origin。
+            gx = column
+            gy = row
         """
 
         resolution = map_msg.info.resolution
@@ -332,13 +457,19 @@ class RegionAllocator:
         origin_x = map_msg.info.origin.position.x
         origin_y = map_msg.info.origin.position.y
 
-        gx = int(np.floor(
-            (x - origin_x) / resolution
-        ))
+        gx = int(
+            np.floor(
+                (x - origin_x) /
+                resolution
+            )
+        )
 
-        gy = int(np.floor(
-            (y - origin_y) / resolution
-        ))
+        gy = int(
+            np.floor(
+                (y - origin_y) /
+                resolution
+            )
+        )
 
         return gx, gy
 
@@ -346,19 +477,31 @@ class RegionAllocator:
     # Grid -> World
     # ================================================================
 
-    def grid_to_world(self, gx, gy, map_msg):
-        """
-        栅格坐标 -> 世界坐标
-        返回栅格中心点
-        """
+    def grid_to_world(
+        self,
+        gx,
+        gy,
+        map_msg
+    ):
 
         resolution = map_msg.info.resolution
 
         origin_x = map_msg.info.origin.position.x
         origin_y = map_msg.info.origin.position.y
 
-        x = origin_x + (gx + 0.5) * resolution
-        y = origin_y + (gy + 0.5) * resolution
+        x = (
+            origin_x
+            +
+            (gx + 0.5) *
+            resolution
+        )
+
+        y = (
+            origin_y
+            +
+            (gy + 0.5) *
+            resolution
+        )
 
         return x, y
 
@@ -366,10 +509,13 @@ class RegionAllocator:
     # Check grid valid
     # ================================================================
 
-    def is_valid_grid(self, gx, gy, width, height):
-        """
-        判断栅格坐标是否在地图范围内
-        """
+    @staticmethod
+    def is_valid_grid(
+        gx,
+        gy,
+        width,
+        height
+    ):
 
         return (
             0 <= gx < width
@@ -389,14 +535,12 @@ class RegionAllocator:
         max_radius=20
     ):
         """
-        寻找距离机器人最近的可通行栅格。
+        寻找机器人附近最近的可通行栅格。
 
-        traversable_mask:
-            True  -> 可以作为路径
-            False -> 不可通行
+        covered_map == 0
+        covered_map == 100
 
-        这样即使机器人当前位于 covered_map == 100，
-        也可以找到附近的 100 或 0 栅格作为 Dijkstra 起点。
+        都属于 traversable。
         """
 
         height, width = traversable_mask.shape
@@ -407,17 +551,37 @@ class RegionAllocator:
             width,
             height
         ):
-            if traversable_mask[start_gy, start_gx]:
-                return start_gx, start_gy
 
-        # 螺旋/半径搜索
-        for radius in range(1, max_radius + 1):
+            if traversable_mask[
+                start_gy,
+                start_gx
+            ]:
 
-            for dx in range(-radius, radius + 1):
+                return (
+                    start_gx,
+                    start_gy
+                )
 
-                for dy in range(-radius, radius + 1):
+        for radius in range(
+            1,
+            max_radius + 1
+        ):
 
-                    if abs(dx) != radius and abs(dy) != radius:
+            for dx in range(
+                -radius,
+                radius + 1
+            ):
+
+                for dy in range(
+                    -radius,
+                    radius + 1
+                ):
+
+                    if (
+                        abs(dx) != radius
+                        and
+                        abs(dy) != radius
+                    ):
                         continue
 
                     gx = start_gx + dx
@@ -431,9 +595,15 @@ class RegionAllocator:
                     ):
                         continue
 
-                    if traversable_mask[gy, gx]:
+                    if traversable_mask[
+                        gy,
+                        gx
+                    ]:
 
-                        return gx, gy
+                        return (
+                            gx,
+                            gy
+                        )
 
         return None
 
@@ -447,14 +617,6 @@ class RegionAllocator:
         map_msg,
         traversable_mask
     ):
-        """
-        获取机器人当前所在的栅格。
-
-        注意：
-        机器人可以位于 covered_map == 100。
-        因此这里不是寻找 task cell，
-        而是寻找 traversable cell。
-        """
 
         gx, gy = self.world_to_grid(
             robot_pose[0],
@@ -464,17 +626,23 @@ class RegionAllocator:
 
         height, width = traversable_mask.shape
 
-        # 当前栅格可以通行
         if self.is_valid_grid(
             gx,
             gy,
             width,
             height
         ):
-            if traversable_mask[gy, gx]:
-                return gx, gy
 
-        # 否则搜索附近可通行区域
+            if traversable_mask[
+                gy,
+                gx
+            ]:
+
+                return (
+                    gx,
+                    gy
+                )
+
         return self.find_nearest_traversable_cell(
             gx,
             gy,
@@ -486,10 +654,13 @@ class RegionAllocator:
     # Neighbors
     # ================================================================
 
-    def get_neighbors(self, x, y, width, height):
-        """
-        4-connected grid
-        """
+    @staticmethod
+    def get_neighbors(
+        x,
+        y,
+        width,
+        height
+    ):
 
         neighbors = [
             (x + 1, y),
@@ -507,7 +678,13 @@ class RegionAllocator:
                 and
                 0 <= ny < height
             ):
-                result.append((nx, ny))
+
+                result.append(
+                    (
+                        nx,
+                        ny
+                    )
+                )
 
         return result
 
@@ -525,73 +702,90 @@ class RegionAllocator:
         """
         多源 Dijkstra。
 
-        traversable_mask:
-            0 或 100
-            都可以作为路径。
+        traversable：
 
-        task_mask:
-            只有 covered_map == 0。
+            0   -> 可以传播
+            100 -> 可以传播
 
-        最终：
-            只有 task_mask 中的栅格才会保留机器人标签。
+        task：
 
-        labels:
-            0 -> 无任务
-            1 -> Robot1
-            2 -> Robot2
+            0 -> 最终保留标签
         """
 
         height, width = traversable_mask.shape
 
-        # 距离
         distances = np.full(
             (height, width),
             np.inf,
             dtype=np.float64
         )
 
-        # 所属机器人
         labels = np.zeros(
             (height, width),
             dtype=np.int8
         )
 
-        # Priority Queue
         heap = []
 
         # ============================================================
-        # Robot 1 source
+        # Robot 1
         # ============================================================
 
         if robot1_cell is not None:
 
             x1, y1 = robot1_cell
 
-            distances[y1, x1] = 0.0
-            labels[y1, x1] = 1
+            distances[
+                y1,
+                x1
+            ] = 0.0
+
+            labels[
+                y1,
+                x1
+            ] = 1
 
             heapq.heappush(
                 heap,
-                (0.0, 1, x1, y1)
+                (
+                    0.0,
+                    1,
+                    x1,
+                    y1
+                )
             )
 
         # ============================================================
-        # Robot 2 source
+        # Robot 2
         # ============================================================
 
         if robot2_cell is not None:
 
             x2, y2 = robot2_cell
 
-            # 如果两个机器人恰好位于同一个栅格
-            if distances[y2, x2] > 0.0:
+            if distances[
+                y2,
+                x2
+            ] > 0.0:
 
-                distances[y2, x2] = 0.0
-                labels[y2, x2] = 2
+                distances[
+                    y2,
+                    x2
+                ] = 0.0
+
+                labels[
+                    y2,
+                    x2
+                ] = 2
 
                 heapq.heappush(
                     heap,
-                    (0.0, 2, x2, y2)
+                    (
+                        0.0,
+                        2,
+                        x2,
+                        y2
+                    )
                 )
 
         # ============================================================
@@ -600,10 +794,15 @@ class RegionAllocator:
 
         while heap:
 
-            current_dist, robot_id, x, y = heapq.heappop(heap)
+            current_dist, robot_id, x, y = heapq.heappop(
+                heap
+            )
 
-            # 跳过旧状态
-            if current_dist > distances[y, x]:
+            if current_dist > distances[
+                y,
+                x
+            ]:
+
                 continue
 
             for nx, ny in self.get_neighbors(
@@ -613,19 +812,35 @@ class RegionAllocator:
                 height
             ):
 
-                # 不能穿过非 traversable 区域
-                if not traversable_mask[ny, nx]:
+                if not traversable_mask[
+                    ny,
+                    nx
+                ]:
+
                     continue
 
-                new_dist = current_dist + 1.0
+                new_dist = (
+                    current_dist
+                    +
+                    1.0
+                )
 
-                old_dist = distances[ny, nx]
+                old_dist = distances[
+                    ny,
+                    nx
+                ]
 
-                # 更短路径
                 if new_dist < old_dist:
 
-                    distances[ny, nx] = new_dist
-                    labels[ny, nx] = robot_id
+                    distances[
+                        ny,
+                        nx
+                    ] = new_dist
+
+                    labels[
+                        ny,
+                        nx
+                    ] = robot_id
 
                     heapq.heappush(
                         heap,
@@ -637,13 +852,18 @@ class RegionAllocator:
                         )
                     )
 
-                # 距离相同
                 elif new_dist == old_dist:
 
                     # Robot1 优先
-                    if robot_id < labels[ny, nx]:
+                    if robot_id < labels[
+                        ny,
+                        nx
+                    ]:
 
-                        labels[ny, nx] = robot_id
+                        labels[
+                            ny,
+                            nx
+                        ] = robot_id
 
                         heapq.heappush(
                             heap,
@@ -656,21 +876,12 @@ class RegionAllocator:
                         )
 
         # ============================================================
-        # 非任务区域全部清零
+        # 最终只保留 task_mask
         # ============================================================
 
-        # 这是本次修改最关键的一步。
-        #
-        # 即使 Dijkstra 穿过 100 区域，
-        # 这些区域也不能成为最终任务区域。
-        #
-        # 因此：
-        #
-        #     labels[covered_map != 0] = 0
-        #
-        # 最终只有 covered_map == 0 的区域拥有机器人标签。
-
-        labels[~task_mask] = 0
+        labels[
+            ~task_mask
+        ] = 0
 
         return labels, distances
 
@@ -681,40 +892,34 @@ class RegionAllocator:
     def inflate_obstacles(
         self,
         map_array,
-        resolution
+        resolution,
+        inflation_radius=None
     ):
-        """
-        对非自由区域进行膨胀。
-
-        对 /covered_map 来说：
-
-            -1 -> 非自由区域 / unknown
-             0 -> 未覆盖自由区域
-           100 -> 已覆盖自由区域
-
-        因此：
-            obstacle_mask = map_array < 0
-        """
 
         obstacle_mask = (
             map_array < 0
         )
 
-        if self.inflation_radius <= 0.0:
+        if inflation_radius is None:
+            inflation_radius = self.inflation_radius
+
+        if inflation_radius <= 0.0:
+
             return obstacle_mask
 
         radius_cells = int(
             np.ceil(
-                self.inflation_radius /
+                inflation_radius /
                 resolution
             )
         )
 
         if radius_cells <= 0:
+
             return obstacle_mask
 
         # ============================================================
-        # 优先使用 scipy
+        # scipy
         # ============================================================
 
         try:
@@ -722,13 +927,18 @@ class RegionAllocator:
             from scipy.ndimage import binary_dilation
 
             yy, xx = np.ogrid[
-                -radius_cells:radius_cells + 1,
-                -radius_cells:radius_cells + 1
+                -radius_cells:
+                radius_cells + 1,
+                -radius_cells:
+                radius_cells + 1
             ]
 
             kernel = (
-                xx * xx + yy * yy
-                <= radius_cells * radius_cells
+                xx * xx
+                +
+                yy * yy
+                <=
+                radius_cells * radius_cells
             )
 
             inflated = binary_dilation(
@@ -742,7 +952,8 @@ class RegionAllocator:
 
             rospy.logwarn_throttle(
                 10.0,
-                "scipy not available, using slow obstacle inflation."
+                "scipy not available, "
+                "using slow obstacle inflation."
             )
 
         # ============================================================
@@ -793,11 +1004,17 @@ class RegionAllocator:
                     dy = ny - gy
 
                     if (
-                        dx * dx + dy * dy
-                        <= radius_cells * radius_cells
+                        dx * dx
+                        +
+                        dy * dy
+                        <=
+                        radius_cells * radius_cells
                     ):
 
-                        inflated[ny, nx] = True
+                        inflated[
+                            ny,
+                            nx
+                        ] = True
 
         return inflated
 
@@ -812,31 +1029,12 @@ class RegionAllocator:
         inflated_obstacle_mask,
         original_map
     ):
-        """
-        创建总区域地图。
-
-        输出定义：
-
-            -1 -> 非任务区域
-                 包括：
-                 * obstacle
-                 * unknown
-                 * 已覆盖区域 100
-
-             0 -> Robot1 负责的未覆盖区域
-
-            100 -> Robot2 负责的未覆盖区域
-        """
 
         region_map = np.full(
             labels.shape,
             -1,
             dtype=np.int8
         )
-
-        # ============================================================
-        # 只有 task_mask == True 才允许输出任务
-        # ============================================================
 
         robot1_mask = (
             (labels == 1)
@@ -854,8 +1052,13 @@ class RegionAllocator:
             (~inflated_obstacle_mask)
         )
 
-        region_map[robot1_mask] = 0
-        region_map[robot2_mask] = 100
+        region_map[
+            robot1_mask
+        ] = 0
+
+        region_map[
+            robot2_mask
+        ] = 100
 
         return region_map
 
@@ -870,17 +1073,6 @@ class RegionAllocator:
         robot_id,
         inflated_obstacle_mask
     ):
-        """
-        创建单机器人区域地图。
-
-        对 robot_id：
-
-            100 -> 该机器人负责的任务
-              0 -> 另一个机器人负责的任务
-             -1 -> 非任务区域
-
-        这样可以继续保持原来节点的接口形式。
-        """
 
         region = np.full(
             labels.shape,
@@ -888,22 +1080,23 @@ class RegionAllocator:
             dtype=np.int8
         )
 
-        # ============================================================
-        # 只有 task_mask 才是任务
-        # ============================================================
-
         valid_task = (
             task_mask
             &
             (~inflated_obstacle_mask)
         )
 
-        # 所有有效任务区域先设为 0
-        region[valid_task] = 0
-
-        # 自己负责的区域设为 100
+        # 所有有效任务区域
+        # 先设置成 0
         region[
-            valid_task &
+            valid_task
+        ] = 0
+
+        # 自己负责的任务
+        # 设置成 100
+        region[
+            valid_task
+            &
             (labels == robot_id)
         ] = 100
 
@@ -919,36 +1112,33 @@ class RegionAllocator:
         source_map,
         publisher
     ):
-        """
-        发布 OccupancyGrid
-        """
 
         msg = OccupancyGrid()
 
-        # Header
         msg.header = source_map.header
 
-        # 保持 map frame
-        msg.header.frame_id = source_map.header.frame_id
+        msg.header.frame_id = (
+            source_map.header.frame_id
+        )
 
-        # Map info
         msg.info = source_map.info
 
-        # 转成 int8
-        msg.data = data_array.astype(
-            np.int8
-        ).flatten().tolist()
+        msg.data = (
+            data_array
+            .astype(np.int8)
+            .flatten()
+            .tolist()
+        )
 
-        publisher.publish(msg)
+        publisher.publish(
+            msg
+        )
 
     # ================================================================
     # Main allocation
     # ================================================================
 
     def allocate(self):
-        """
-        执行一次完整的区域分配。
-        """
 
         if self.covered_map is None:
             return
@@ -966,7 +1156,7 @@ class RegionAllocator:
         resolution = map_msg.info.resolution
 
         # ============================================================
-        # Convert map to numpy
+        # Convert map
         # ============================================================
 
         map_array = np.asarray(
@@ -978,34 +1168,46 @@ class RegionAllocator:
         )
 
         # ============================================================
-        # 核心修改
+        # Task mask
         # ============================================================
-
-        # ------------------------------------------------------------
-        # task_mask
-        #
-        # 只有 covered_map == 0 才是需要分配的任务。
-        #
-        # 100 = 已经覆盖
-        # -1  = 非自由/未知
-        # ------------------------------------------------------------
 
         task_mask = (
             map_array == 0
         )
 
-        # ------------------------------------------------------------
-        # traversable_mask
+        # ============================================================
+        # Covered inflation
+        # 已覆盖区域 100 向外膨胀，膨胀区域不再作为任务
+        # ============================================================
+
+        if self.covered_inflation_radius > 0.0:
+
+            covered_source_map = np.where(
+                map_array == 100,
+                -1,
+                0
+            )
+
+            inflated_covered_mask = self.inflate_obstacles(
+                covered_source_map,
+                resolution,
+                self.covered_inflation_radius
+            )
+
+            task_mask = (
+                task_mask
+                &
+                (~inflated_covered_mask)
+            )
+
+        # ============================================================
+        # Traversable mask
         #
-        # 允许机器人在：
+        # 0   -> 可以走
+        # 100 -> 可以走
         #
-        #     0   未覆盖区域
-        #     100 已覆盖区域
-        #
-        # 中移动。
-        #
-        # 但是最终只有 0 会被分配。
-        # ------------------------------------------------------------
+        # -1  -> 不可以走
+        # ============================================================
 
         traversable_mask = (
             (map_array == 0)
@@ -1018,15 +1220,21 @@ class RegionAllocator:
         # ============================================================
 
         task_count = int(
-            np.sum(task_mask)
+            np.sum(
+                task_mask
+            )
         )
 
         covered_count = int(
-            np.sum(map_array == 100)
+            np.sum(
+                map_array == 100
+            )
         )
 
         obstacle_count = int(
-            np.sum(map_array < 0)
+            np.sum(
+                map_array < 0
+            )
         )
 
         rospy.loginfo(
@@ -1040,7 +1248,7 @@ class RegionAllocator:
         )
 
         # ============================================================
-        # Get robot grid cells
+        # Robot grid cells
         # ============================================================
 
         robot1_cell = self.get_robot_cell(
@@ -1056,14 +1264,14 @@ class RegionAllocator:
         )
 
         # ============================================================
-        # Check robot cells
+        # Check
         # ============================================================
 
         if robot1_cell is None:
 
             rospy.logwarn(
-                "Cannot find traversable cell near robot1 "
-                "position (%.2f, %.2f)",
+                "Cannot find traversable cell near "
+                "robot1 position (%.2f, %.2f)",
                 self.robot1_pose[0],
                 self.robot1_pose[1]
             )
@@ -1073,8 +1281,8 @@ class RegionAllocator:
         if robot2_cell is None:
 
             rospy.logwarn(
-                "Cannot find traversable cell near robot2 "
-                "position (%.2f, %.2f)",
+                "Cannot find traversable cell near "
+                "robot2 position (%.2f, %.2f)",
                 self.robot2_pose[0],
                 self.robot2_pose[1]
             )
@@ -1139,7 +1347,7 @@ class RegionAllocator:
         )
 
         # ============================================================
-        # Statistics of allocation
+        # Allocation statistics
         # ============================================================
 
         robot1_task_count = int(

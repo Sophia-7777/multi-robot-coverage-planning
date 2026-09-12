@@ -30,9 +30,9 @@ roslaunch multi_robot_sim dual_turtlebot3_slam.launch
 
 roslaunch multi_robot_sim dual_turtlebot3_slam+rviz.launch
 
-roslaunch multi_robot_sim map_fusion.launch
-
 rosrun multi_robot_sim map_postprocessor.py
+
+roslaunch multi_robot_sim map_fusion.launch
 
 rosrun multi_robot_sim coverage_space+free_space.py
 

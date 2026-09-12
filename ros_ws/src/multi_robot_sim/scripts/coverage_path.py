@@ -4,14 +4,13 @@
 import math
 import heapq
 import threading
-import copy
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple
 
 import numpy as np
 import rospy
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import OccupancyGrid, Path
 from gazebo_msgs.msg import ModelStates
 from visualization_msgs.msg import Marker, MarkerArray
@@ -33,6 +32,7 @@ class PathSegment:
         connector : 两条覆盖段之间的连接 / 掉头
         start     : 从机器人当前位置到第一条覆盖线
     """
+
     points: List[Tuple[int, int]]
     segment_type: str
 
@@ -42,6 +42,7 @@ class CoverageCandidate:
     """
     一个 BCD cell 的候选覆盖方案。
     """
+
     cell_id: int
     angle: float
     phase: float
@@ -79,7 +80,7 @@ class CoveragePathPlanner:
 
         self.coverage_spacing = rospy.get_param(
             "~coverage_spacing",
-            0.60
+            1.4
         )
 
         self.robot_linear_speed = rospy.get_param(
@@ -104,7 +105,7 @@ class CoveragePathPlanner:
 
         self.max_angle_candidates = rospy.get_param(
             "~max_angle_candidates",
-            7
+            5
         )
 
         self.angle_step_deg = rospy.get_param(
@@ -114,7 +115,12 @@ class CoveragePathPlanner:
 
         self.phase_samples = rospy.get_param(
             "~phase_samples",
-            3
+            2
+        )
+
+        self.candidate_top_k = rospy.get_param(
+            "~candidate_top_k",
+            4
         )
 
         self.astar_diagonal = rospy.get_param(
@@ -122,19 +128,95 @@ class CoveragePathPlanner:
             True
         )
 
-        self.simplify_connector = rospy.get_param(
-            "~simplify_connector",
-            True
+        self.covered_cost = rospy.get_param(
+            "~covered_cost",
+            5.0
         )
 
-        self.replan_start_threshold = rospy.get_param(
-            "~replan_start_threshold",
+        self.covered_inflation_radius = rospy.get_param(
+            "~covered_inflation_radius",
             0.30
         )
 
+        if self.covered_inflation_radius < 0.0:
+
+            rospy.logwarn(
+                "[CoveragePlanner] covered_inflation_radius < 0.0, "
+                "forcing it to 0.0"
+            )
+
+            self.covered_inflation_radius = 0.0
+
+        if self.covered_cost < 1.0:
+
+            rospy.logwarn(
+                "[CoveragePlanner] covered_cost < 1.0, "
+                "forcing it to 1.0"
+            )
+
+            self.covered_cost = 1.0
+
+        self.simplify_connector = rospy.get_param(
+            "~simplify_connector",
+            False
+        )
+
+        # ====================================================
+        # 下面几个参数是新增的
+        # ====================================================
+
+        # covered_map 最短重新检查周期。
+        #
+        # 注意：
+        # 不是每次 covered_map callback 都规划。
+        self.covered_replan_interval = rospy.get_param(
+            "~covered_replan_interval",
+            2.0
+        )
+
+        # 当前 task 有多少比例已经被 covered，
+        # 才认为当前 task 明显受到影响。
+        #
+        # 例如：
+        #     0.25
+        #
+        # 表示当前 task 剩余 coverage 点中，
+        # 至少 25% 已经变成 covered，
+        # 才触发 local replan。
+        self.task_covered_ratio_threshold = rospy.get_param(
+            "~task_covered_ratio_threshold",
+            0.25
+        )
+
+        # 判断 coverage task 是否已经被机器人走过。
+        #
+        # 当前 coverage path 点附近只要有一定比例 covered，
+        # 就认为该点已经完成。
+        self.task_point_covered_ratio = rospy.get_param(
+            "~task_point_covered_ratio",
+            0.80
+        )
+
+        # local replan 最少剩余 coverage 点。
+        #
+        # 如果剩余任务太少，则直接等待完成，
+        # 不再浪费计算资源。
+        self.min_local_replan_points = rospy.get_param(
+            "~min_local_replan_points",
+            5
+        )
+
+        # local replanning 后，
+        # 如果剩余任务太短，直接保留当前路径。
+        self.min_remaining_task_points = rospy.get_param(
+            "~min_remaining_task_points",
+            3
+        )
+
+        # planning_period 仍然控制 worker 检查频率。
         self.planning_period = rospy.get_param(
             "~planning_period",
-            0.05
+            1.0
         )
 
         self.scan_band_cells = rospy.get_param(
@@ -178,12 +260,57 @@ class CoveragePathPlanner:
             2: None
         }
 
+        # 最新 covered_map
+        self.covered_map = None
+
+        # ====================================================
+        # 新增：
+        #
+        # covered_map 只设置 dirty，
+        # 不直接让 robot_dirty=true。
+        # ====================================================
+
+        self.covered_dirty = False
+
+        self.last_covered_check_time = 0.0
+
+        # ----------------------------------------------------
+        # Robot dirty
+        # ----------------------------------------------------
+
         self.robot_dirty = {
             1: False,
             2: False
         }
 
         self.robot_planning = {
+            1: False,
+            2: False
+        }
+
+        # ====================================================
+        # 当前正在执行的 task
+        #
+        # current_task_segments:
+        #
+        #     当前已经发布给机器人执行的完整任务
+        #
+        # local replan 会基于这个任务进行。
+        # ====================================================
+
+        self.current_task_segments = {
+            1: [],
+            2: []
+        }
+
+        # 当前 task 对应的 map geometry
+        self.current_task_map = {
+            1: None,
+            2: None
+        }
+
+        # 当前 task 是否有效
+        self.current_task_valid = {
             1: False,
             2: False
         }
@@ -260,11 +387,17 @@ class CoveragePathPlanner:
             )
         }
 
+        self.covered_map_sub = rospy.Subscriber(
+            "/covered_map",
+            OccupancyGrid,
+            self.covered_map_callback,
+            queue_size=1
+        )
+
         self.model_states_sub = rospy.Subscriber(
             "/gazebo/model_states",
             ModelStates,
-            self.model_states_callback,
-            queue_size=1
+            self.model_states_callback
         )
 
         # ----------------------------------------------------
@@ -288,6 +421,41 @@ class CoveragePathPlanner:
             "[CoveragePlanner] started"
         )
 
+        rospy.loginfo(
+            "[CoveragePlanner] covered_cost = %.2f",
+            self.covered_cost
+        )
+
+        rospy.loginfo(
+            "[CoveragePlanner] covered_inflation_radius = %.2f m",
+            self.covered_inflation_radius
+        )
+
+        rospy.loginfo(
+            "[CoveragePlanner] covered_replan_interval = %.2f",
+            self.covered_replan_interval
+        )
+
+        rospy.loginfo(
+            "[CoveragePlanner] task_covered_ratio_threshold = %.2f",
+            self.task_covered_ratio_threshold
+        )
+
+        rospy.loginfo(
+            "[CoveragePlanner] max_angle_candidates = %d",
+            self.max_angle_candidates
+        )
+
+        rospy.loginfo(
+            "[CoveragePlanner] phase_samples = %d",
+            self.phase_samples
+        )
+
+        rospy.loginfo(
+            "[CoveragePlanner] candidate_top_k = %d",
+            self.candidate_top_k
+        )
+
     # ========================================================
     # ROS callbacks
     # ========================================================
@@ -295,8 +463,14 @@ class CoveragePathPlanner:
     def robot1_region_callback(self, msg):
 
         with self.state_lock:
+
             self.robot_regions[1] = msg
+
+            # region 变化属于真正的 global planning trigger
             self.robot_dirty[1] = True
+
+            # 原来的 current task 可能已经失效
+            self.current_task_valid[1] = False
 
         rospy.loginfo_throttle(
             2.0,
@@ -306,18 +480,47 @@ class CoveragePathPlanner:
     def robot2_region_callback(self, msg):
 
         with self.state_lock:
+
             self.robot_regions[2] = msg
+
             self.robot_dirty[2] = True
+
+            self.current_task_valid[2] = False
 
         rospy.loginfo_throttle(
             2.0,
             "[CoveragePlanner] robot2 region updated"
         )
 
-    def model_states_callback(self, msg):
+    def covered_map_callback(self, msg):
 
-        # 这里只做轻量级位置更新。
-        # 绝对不能在这里做 BCD / A* / 路径优化。
+        with self.state_lock:
+
+            self.covered_map = msg
+
+            # =================================================
+            # 关键修改
+            #
+            # 不再：
+            #
+            #     robot_dirty[1] = True
+            #     robot_dirty[2] = True
+            #
+            # 而是只记录：
+            #
+            #     covered_dirty = True
+            #
+            # worker 后面检查 current task 是否真的受影响。
+            # =================================================
+
+            self.covered_dirty = True
+
+        rospy.loginfo_throttle(
+            2.0,
+            "[CoveragePlanner] covered_map updated"
+        )
+
+    def model_states_callback(self, msg):
 
         with self.state_lock:
 
@@ -352,10 +555,23 @@ class CoveragePathPlanner:
     def planning_worker(self):
 
         rate = rospy.Rate(
-            1.0 / self.planning_period
+            1.0 / max(
+                self.planning_period,
+                0.01
+            )
         )
 
         while not rospy.is_shutdown():
+
+            # =================================================
+            # Step 1:
+            #
+            # 先检查 covered_map 是否影响当前 task。
+            #
+            # 这里只做轻量判断。
+            # =================================================
+
+            self.check_covered_task_impact()
 
             jobs = []
 
@@ -369,29 +585,37 @@ class CoveragePathPlanner:
                         not self.robot_planning[robot_id]
                         and
                         self.robot_regions[robot_id] is not None
+                        and
+                        self.covered_map is not None
                     ):
 
                         self.robot_planning[robot_id] = True
 
                         region = self.robot_regions[robot_id]
+                        covered = self.covered_map
 
                         self.robot_dirty[robot_id] = False
 
                         jobs.append(
                             (
                                 robot_id,
-                                region
+                                region,
+                                covered
                             )
                         )
 
+            # =================================================
             # 不持有 state_lock 做重规划
-            for robot_id, region in jobs:
+            # =================================================
+
+            for robot_id, region, covered in jobs:
 
                 try:
 
                     self.process_robot(
                         robot_id,
-                        region
+                        region,
+                        covered
                     )
 
                 except Exception as exc:
@@ -405,9 +629,570 @@ class CoveragePathPlanner:
                 finally:
 
                     with self.state_lock:
+
                         self.robot_planning[robot_id] = False
 
             rate.sleep()
+
+    # ========================================================
+    # Check whether covered_map affects current task
+    # ========================================================
+
+    def check_covered_task_impact(self):
+
+        now = rospy.get_time()
+
+        with self.state_lock:
+
+            if not self.covered_dirty:
+                return
+
+            if (
+                now - self.last_covered_check_time
+                <
+                self.covered_replan_interval
+            ):
+                return
+
+            covered_msg = self.covered_map
+
+            self.last_covered_check_time = now
+
+            # 这一次变化已经被取出来检查
+            self.covered_dirty = False
+
+        if covered_msg is None:
+            return
+
+        # ----------------------------------------------------
+        # 分别检查两个机器人
+        # ----------------------------------------------------
+
+        for robot_id in (1, 2):
+
+            with self.state_lock:
+
+                if self.robot_planning[robot_id]:
+                    continue
+
+                if not self.current_task_valid[robot_id]:
+                    continue
+
+                segments = list(
+                    self.current_task_segments[robot_id]
+                )
+
+                region_msg = self.robot_regions[robot_id]
+
+                current_pose = self.robot_positions[robot_id]
+
+            if not segments:
+                continue
+
+            if region_msg is None:
+                continue
+
+            # ------------------------------------------------
+            # geometry mismatch
+            # ------------------------------------------------
+
+            if not self.same_map_geometry(
+                region_msg,
+                covered_msg
+            ):
+                continue
+
+            affected, remaining_points = (
+                self.current_task_is_affected(
+                    segments,
+                    covered_msg
+                )
+            )
+
+            if not affected:
+                continue
+
+            rospy.loginfo(
+                "[CoveragePlanner] robot%d current task "
+                "affected by covered_map: remaining=%d",
+                robot_id,
+                remaining_points
+            )
+
+            if current_pose is None:
+                continue
+
+            # =================================================
+            # Local replan
+            # =================================================
+
+            success = self.local_replan_current_task(
+                robot_id,
+                region_msg,
+                covered_msg,
+                segments
+            )
+
+            if success:
+
+                rospy.loginfo(
+                    "[CoveragePlanner] robot%d local replan success",
+                    robot_id
+                )
+
+            else:
+
+                rospy.logwarn(
+                    "[CoveragePlanner] robot%d local replan failed, "
+                    "requesting global replan",
+                    robot_id
+                )
+
+                with self.state_lock:
+
+                    self.robot_dirty[robot_id] = True
+
+    # ========================================================
+    # Determine whether current task is affected
+    # ========================================================
+
+    def current_task_is_affected(
+        self,
+        segments,
+        covered_msg
+    ):
+        """
+        判断当前 task 是否真的受到 covered_map 影响。
+
+        注意：
+
+        不是简单判断：
+            covered_map 更新了
+            -> replan
+
+        而是：
+
+            当前剩余 coverage path
+                    ↓
+            有多少已经 covered
+                    ↓
+            超过 threshold
+                    ↓
+            才认为 task 受到影响
+        """
+
+        covered = self.occupancy_grid_to_numpy(
+            covered_msg
+        )
+
+        coverage_points = []
+
+        for segment in segments:
+
+            if segment.segment_type != "coverage":
+                continue
+
+            for point in segment.points:
+
+                if point not in coverage_points:
+
+                    coverage_points.append(
+                        point
+                    )
+
+        if len(coverage_points) < self.min_local_replan_points:
+
+            return (
+                False,
+                len(coverage_points)
+            )
+
+        total = len(
+            coverage_points
+        )
+
+        covered_count = 0
+
+        for r, c in coverage_points:
+
+            if (
+                0 <= r < covered.shape[0]
+                and
+                0 <= c < covered.shape[1]
+                and
+                covered[r, c] == 100
+            ):
+
+                covered_count += 1
+
+        ratio = (
+            covered_count /
+            float(max(total, 1))
+        )
+
+        rospy.logdebug(
+            "[CoveragePlanner] task covered ratio = %.3f",
+            ratio
+        )
+
+        if (
+            ratio >=
+            self.task_covered_ratio_threshold
+        ):
+
+            return (
+                True,
+                total - covered_count
+            )
+
+        return (
+            False,
+            total - covered_count
+        )
+
+    # ========================================================
+    # Local replan
+    # ========================================================
+
+    def local_replan_current_task(
+        self,
+        robot_id,
+        region_msg,
+        covered_msg,
+        old_segments
+    ):
+        """
+        局部重新规划。
+
+        不重新执行：
+
+            BCD
+            angle search
+            phase search
+            candidate generation
+            DP
+
+        只做：
+
+            current robot pose
+                    ↓
+            当前 task 中剩余的 coverage
+                    ↓
+            找第一个未覆盖点
+                    ↓
+            A* connector
+                    ↓
+            保留后面的 task
+
+        这是整个优化的核心。
+        """
+
+        with self.state_lock:
+
+            current_pose = self.robot_positions[robot_id]
+
+        if current_pose is None:
+            return False
+
+        # ----------------------------------------------------
+        # Convert maps
+        # ----------------------------------------------------
+
+        region = self.occupancy_grid_to_numpy(
+            region_msg
+        )
+
+        covered = self.occupancy_grid_to_numpy(
+            covered_msg
+        )
+
+        own_region = (
+            region == 100
+        )
+
+        already_covered = (
+            covered == 100
+        )
+
+        inflated_covered = self.inflate_covered_map(
+            already_covered,
+            resolution
+        )
+
+        # 膨胀区域可以作为 connector 通过，但不会成为新的 coverage task。
+        # 同时避免膨胀把 region_map 中的障碍（-1）变成可通行区域。
+        inflated_covered &= (
+            occupancy >= 0
+        )
+
+        connector_map = (
+            own_region
+            |
+            inflated_covered
+        )
+
+        path_cost_map = np.ones(
+            covered.shape,
+            dtype=np.float64
+        )
+
+        path_cost_map[
+            inflated_covered
+        ] = self.covered_cost
+
+        # ----------------------------------------------------
+        # Current robot grid
+        # ----------------------------------------------------
+
+        start_grid = self.world_to_grid(
+            current_pose[0],
+            current_pose[1],
+            region_msg
+        )
+
+        start_grid = self.find_nearest_free_cell(
+            start_grid,
+            connector_map
+        )
+
+        if start_grid is None:
+            return False
+
+        # ----------------------------------------------------
+        # Build remaining task
+        # ----------------------------------------------------
+
+        remaining_segments = []
+
+        found_first_uncovered = False
+
+        for segment in old_segments:
+
+            if segment.segment_type != "coverage":
+
+                # connector/start：
+                # 只在还没有找到新的 coverage 起点时忽略。
+                #
+                # 后续 connector 将由 A* 重新生成。
+                continue
+
+            points = segment.points
+
+            if not points:
+                continue
+
+            remaining = []
+
+            for point in points:
+
+                r, c = point
+
+                is_covered = (
+                    0 <= r < covered.shape[0]
+                    and
+                    0 <= c < covered.shape[1]
+                    and
+                    covered[r, c] == 100
+                )
+
+                if not found_first_uncovered:
+
+                    if is_covered:
+                        continue
+
+                    found_first_uncovered = True
+
+                    remaining.append(
+                        point
+                    )
+
+                else:
+
+                    remaining.append(
+                        point
+                    )
+
+            if len(remaining) >= 2:
+
+                remaining_segments.append(
+                    PathSegment(
+                        points=remaining,
+                        segment_type="coverage"
+                    )
+                )
+
+        # ----------------------------------------------------
+        # 没有剩余 coverage
+        #
+        # 当前 task 已经完成。
+        # ----------------------------------------------------
+
+        if not remaining_segments:
+
+            rospy.loginfo(
+                "[CoveragePlanner] robot%d current task completed "
+                "by covered_map",
+                robot_id
+            )
+
+            self.publish_empty_path(
+                robot_id,
+                region_msg.header.frame_id
+            )
+
+            with self.state_lock:
+
+                self.current_task_segments[robot_id] = []
+
+                self.current_task_valid[robot_id] = False
+
+                # 当前 task 完成后，
+                # 下一次 worker 可以做 global planning。
+                self.robot_dirty[robot_id] = True
+
+            return True
+
+        # ----------------------------------------------------
+        # Find first remaining point
+        # ----------------------------------------------------
+
+        first_target = None
+
+        for segment in remaining_segments:
+
+            if segment.points:
+
+                first_target = segment.points[0]
+                break
+
+        if first_target is None:
+            return False
+
+        # ----------------------------------------------------
+        # Local A*
+        # ----------------------------------------------------
+
+        self.astar_cache.clear()
+
+        connector = self.astar(
+            start_grid,
+            first_target,
+            connector_map,
+            path_cost_map
+        )
+
+        if connector is None:
+
+            rospy.logwarn(
+                "[CoveragePlanner] robot%d local connector "
+                "cannot reach current task",
+                robot_id
+            )
+
+            return False
+
+        connector = self.remove_consecutive_duplicates(
+            connector
+        )
+
+        new_segments = []
+
+        if len(connector) >= 2:
+
+            if self.simplify_connector:
+
+                connector = self.shortcut_path(
+                    connector,
+                    connector_map
+                )
+
+            new_segments.append(
+                PathSegment(
+                    points=connector,
+                    segment_type="start"
+                )
+            )
+
+        # ----------------------------------------------------
+        # Append remaining coverage
+        # ----------------------------------------------------
+
+        for segment in remaining_segments:
+
+            new_segments.append(
+                PathSegment(
+                    points=list(segment.points),
+                    segment_type="coverage"
+                )
+            )
+
+        # ----------------------------------------------------
+        # 如果剩余任务太少，
+        # 没必要再发布复杂 local path。
+        # ----------------------------------------------------
+
+        total_remaining = sum(
+            len(segment.points)
+            for segment in remaining_segments
+        )
+
+        if (
+            total_remaining
+            <
+            self.min_remaining_task_points
+        ):
+
+            rospy.loginfo(
+                "[CoveragePlanner] robot%d local task almost finished",
+                robot_id
+            )
+
+        # ----------------------------------------------------
+        # Publish local path
+        # ----------------------------------------------------
+
+        resolution = region_msg.info.resolution
+
+        origin_x = region_msg.info.origin.position.x
+        origin_y = region_msg.info.origin.position.y
+
+        origin_yaw = self.quaternion_to_yaw(
+            region_msg.info.origin.orientation
+        )
+
+        self.publish_segments(
+            robot_id,
+            new_segments,
+            region_msg,
+            resolution,
+            origin_x,
+            origin_y,
+            origin_yaw
+        )
+
+        self.publish_path_arrows(
+            robot_id,
+            new_segments,
+            region_msg,
+            resolution,
+            origin_x,
+            origin_y,
+            origin_yaw
+        )
+
+        # ----------------------------------------------------
+        # 保存新的 current task
+        # ----------------------------------------------------
+
+        with self.state_lock:
+
+            self.current_task_segments[robot_id] = (
+                new_segments
+            )
+
+            self.current_task_valid[robot_id] = True
+
+        return True
 
     # ========================================================
     # Robot planning
@@ -416,8 +1201,11 @@ class CoveragePathPlanner:
     def process_robot(
         self,
         robot_id: int,
-        region_msg: OccupancyGrid
+        region_msg: OccupancyGrid,
+        covered_msg: OccupancyGrid
     ):
+
+        self.astar_cache.clear()
 
         # ----------------------------------------------------
         # Snapshot robot pose
@@ -437,11 +1225,32 @@ class CoveragePathPlanner:
             return
 
         # ----------------------------------------------------
-        # Convert occupancy grid
+        # Check map geometry
+        # ----------------------------------------------------
+
+        if not self.same_map_geometry(
+            region_msg,
+            covered_msg
+        ):
+
+            rospy.logerr(
+                "[CoveragePlanner] robot%d region map and "
+                "covered_map geometry mismatch",
+                robot_id
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Convert occupancy grids
         # ----------------------------------------------------
 
         occupancy = self.occupancy_grid_to_numpy(
             region_msg
+        )
+
+        covered = self.occupancy_grid_to_numpy(
+            covered_msg
         )
 
         resolution = region_msg.info.resolution
@@ -454,7 +1263,7 @@ class CoveragePathPlanner:
         )
 
         # ----------------------------------------------------
-        # Own region = 100
+        # Own region
         # ----------------------------------------------------
 
         own_region = (
@@ -475,8 +1284,38 @@ class CoveragePathPlanner:
 
             return
 
+        already_covered = (
+            covered == 100
+        )
+
+        inflated_covered = self.inflate_covered_map(
+            already_covered,
+            resolution
+        )
+
+        # 膨胀区域可以作为 connector 通过，但不会成为新的 coverage task。
+        # 同时避免膨胀把 region_map 中的障碍（-1）变成可通行区域。
+        inflated_covered &= (
+            occupancy >= 0
+        )
+
+        connector_map = (
+            own_region
+            |
+            inflated_covered
+        )
+
+        path_cost_map = np.ones(
+            covered.shape,
+            dtype=np.float64
+        )
+
+        path_cost_map[
+            inflated_covered
+        ] = self.covered_cost
+
         # ----------------------------------------------------
-        # Convert robot start to grid
+        # Convert robot start
         # ----------------------------------------------------
 
         start_grid = self.world_to_grid(
@@ -487,7 +1326,7 @@ class CoveragePathPlanner:
 
         start_grid = self.find_nearest_free_cell(
             start_grid,
-            own_region
+            connector_map
         )
 
         if start_grid is None:
@@ -498,6 +1337,13 @@ class CoveragePathPlanner:
             )
 
             return
+
+        rospy.loginfo(
+            "[CoveragePlanner] robot%d start grid = (%d,%d)",
+            robot_id,
+            start_grid[0],
+            start_grid[1]
+        )
 
         # ----------------------------------------------------
         # BCD
@@ -544,12 +1390,19 @@ class CoveragePathPlanner:
             )
 
             for r, c in cell.pixels:
-                mask[r, c] = True
+
+                if (
+                    0 <= r < mask.shape[0]
+                    and
+                    0 <= c < mask.shape[1]
+                ):
+
+                    mask[r, c] = True
 
             cell_masks[cell.id] = mask
 
         # ----------------------------------------------------
-        # Generate candidate paths
+        # Generate candidates
         # ----------------------------------------------------
 
         all_candidates = {}
@@ -593,18 +1446,20 @@ class CoveragePathPlanner:
         )
 
         ordered_cells = [
-            c for c in ordered_cells
+            c
+            for c in ordered_cells
             if c.id in all_candidates
         ]
 
         # ----------------------------------------------------
-        # Select best candidate per cell
+        # Optimize
         # ----------------------------------------------------
 
         selected = self.optimize_cell_route(
             ordered_cells,
             all_candidates,
-            own_region,
+            connector_map,
+            path_cost_map,
             start_grid,
             resolution
         )
@@ -619,13 +1474,14 @@ class CoveragePathPlanner:
             return
 
         # ----------------------------------------------------
-        # Build segmented final path
+        # Build final path
         # ----------------------------------------------------
 
         segments = self.build_final_segments(
             start_grid,
             selected,
-            own_region
+            connector_map,
+            path_cost_map
         )
 
         if not segments:
@@ -637,34 +1493,28 @@ class CoveragePathPlanner:
 
             return
 
-        # ----------------------------------------------------
-        # Validate robot hasn't moved during planning
-        # ----------------------------------------------------
-
-        with self.state_lock:
-
-            current_pose = self.robot_positions[robot_id]
-
-        if current_pose is None:
-            return
-
-        movement = math.hypot(
-            current_pose[0] - start_pose[0],
-            current_pose[1] - start_pose[1]
-        )
-
-        if movement > self.replan_start_threshold:
-
-            rospy.logwarn(
-                "[CoveragePlanner] robot%d moved %.2fm during planning, discard old path",
-                robot_id,
-                movement
-            )
-
-            with self.state_lock:
-                self.robot_dirty[robot_id] = True
-
-            return
+        # ====================================================
+        # 重要：
+        #
+        # 删除原来的：
+        #
+        #     robot moved > 0.30m
+        #     -> discard old path
+        #
+        # 这一逻辑会导致：
+        #
+        #     planning 15s
+        #         ↓
+        #     robot 移动 1m
+        #         ↓
+        #     discard
+        #         ↓
+        #     dirty
+        #         ↓
+        #     再规划
+        #
+        # 现在不再因为机器人正常移动而丢弃整个规划。
+        # ====================================================
 
         # ----------------------------------------------------
         # Publish
@@ -696,10 +1546,189 @@ class CoveragePathPlanner:
             origin_yaw
         )
 
+        # ====================================================
+        # 保存 current task
+        # ====================================================
+
+        with self.state_lock:
+
+            self.current_task_segments[robot_id] = (
+                segments
+            )
+
+            self.current_task_map[robot_id] = (
+                region_msg
+            )
+
+            self.current_task_valid[robot_id] = True
+
         rospy.loginfo(
             "[CoveragePlanner] robot%d path published",
             robot_id
         )
+
+    # ========================================================
+    # Map geometry
+    # ========================================================
+
+    @staticmethod
+    def same_map_geometry(
+        a,
+        b
+    ):
+
+        if a.info.width != b.info.width:
+            return False
+
+        if a.info.height != b.info.height:
+            return False
+
+        if not math.isclose(
+            a.info.resolution,
+            b.info.resolution,
+            rel_tol=1e-6,
+            abs_tol=1e-9
+        ):
+            return False
+
+        if not math.isclose(
+            a.info.origin.position.x,
+            b.info.origin.position.x,
+            abs_tol=1e-6
+        ):
+            return False
+
+        if not math.isclose(
+            a.info.origin.position.y,
+            b.info.origin.position.y,
+            abs_tol=1e-6
+        ):
+            return False
+
+        if not math.isclose(
+            a.info.origin.position.z,
+            b.info.origin.position.z,
+            abs_tol=1e-6
+        ):
+            return False
+
+        if not math.isclose(
+            a.info.origin.orientation.x,
+            b.info.origin.orientation.x,
+            abs_tol=1e-6
+        ):
+            return False
+
+        if not math.isclose(
+            a.info.origin.orientation.y,
+            b.info.origin.orientation.y,
+            abs_tol=1e-6
+        ):
+            return False
+
+        if not math.isclose(
+            a.info.origin.orientation.z,
+            b.info.origin.orientation.z,
+            abs_tol=1e-6
+        ):
+            return False
+
+        if not math.isclose(
+            a.info.origin.orientation.w,
+            b.info.origin.orientation.w,
+            abs_tol=1e-6
+        ):
+            return False
+
+        return True
+
+    # ========================================================
+    # Covered map inflation
+    # ========================================================
+
+    def inflate_covered_map(
+        self,
+        covered_mask,
+        resolution
+    ):
+        """
+        对 covered_map == 100 的区域进行圆形膨胀。
+
+        膨胀后的区域用于 connector_map，并统一赋予 covered_cost。
+        不改变 own_region，因此不会增加新的 BCD coverage task。
+        """
+
+        if self.covered_inflation_radius <= 0.0:
+            return covered_mask.copy()
+
+        radius_cells = int(
+            math.ceil(
+                self.covered_inflation_radius /
+                max(float(resolution), 1e-9)
+            )
+        )
+
+        if radius_cells <= 0:
+            return covered_mask.copy()
+
+        try:
+            from scipy.ndimage import binary_dilation
+
+            yy, xx = np.ogrid[
+                -radius_cells:
+                radius_cells + 1,
+                -radius_cells:
+                radius_cells + 1
+            ]
+
+            kernel = (
+                xx * xx
+                +
+                yy * yy
+                <=
+                radius_cells * radius_cells
+            )
+
+            return binary_dilation(
+                covered_mask,
+                structure=kernel
+            )
+
+        except ImportError:
+            rospy.logwarn_throttle(
+                10.0,
+                "[CoveragePlanner] scipy not available, "
+                "using slow covered inflation."
+            )
+
+        inflated = covered_mask.copy()
+        rows, cols = covered_mask.shape
+
+        covered_indices = np.argwhere(covered_mask)
+
+        for r, c in covered_indices:
+
+            r_min = max(0, r - radius_cells)
+            r_max = min(rows, r + radius_cells + 1)
+            c_min = max(0, c - radius_cells)
+            c_max = min(cols, c + radius_cells + 1)
+
+            for nr in range(r_min, r_max):
+                for nc in range(c_min, c_max):
+
+                    dr = nr - r
+                    dc = nc - c
+
+                    if (
+                        dr * dr
+                        +
+                        dc * dc
+                        <=
+                        radius_cells * radius_cells
+                    ):
+                        inflated[nr, nc] = True
+
+        return inflated
 
     # ========================================================
     # Occupancy conversion
@@ -707,7 +1736,7 @@ class CoveragePathPlanner:
 
     def occupancy_grid_to_numpy(
         self,
-        msg: OccupancyGrid
+        msg
     ):
 
         h = msg.info.height
@@ -717,6 +1746,20 @@ class CoveragePathPlanner:
             msg.data,
             dtype=np.int16
         )
+
+        expected = h * w
+
+        if data.size != expected:
+
+            raise ValueError(
+                "OccupancyGrid data size mismatch: "
+                "%d != %d"
+                %
+                (
+                    data.size,
+                    expected
+                )
+            )
 
         return data.reshape(
             (h, w)
@@ -895,6 +1938,7 @@ class CoveragePathPlanner:
         )
 
         if free_map[sr, sc]:
+
             return (
                 sr,
                 sc
@@ -921,9 +1965,12 @@ class CoveragePathPlanner:
             (1, 1)
         ]
 
-        while queue:
+        head = 0
 
-            r, c = queue.pop(0)
+        while head < len(queue):
+
+            r, c = queue[head]
+            head += 1
 
             for dr, dc in directions:
 
@@ -952,11 +1999,17 @@ class CoveragePathPlanner:
                     )
 
                 visited.add(
-                    (nr, nc)
+                    (
+                        nr,
+                        nc
+                    )
                 )
 
                 queue.append(
-                    (nr, nc)
+                    (
+                        nr,
+                        nc
+                    )
                 )
 
         return None
@@ -981,7 +2034,6 @@ class CoveragePathPlanner:
                 0.0
             ]
 
-        # PCA
         center = pixels.mean(
             axis=0
         )
@@ -1003,7 +2055,6 @@ class CoveragePathPlanner:
                 np.argmax(eigenvalues)
             ]
 
-            # row/col -> x/y
             theta_pca = math.atan2(
                 direction[0],
                 direction[1]
@@ -1015,7 +2066,6 @@ class CoveragePathPlanner:
 
         angles = []
 
-        # PCA 附近
         for k in range(
             -2,
             3
@@ -1035,7 +2085,6 @@ class CoveragePathPlanner:
                 )
             )
 
-        # 常用方向
         angles.extend(
             [
                 0.0,
@@ -1045,7 +2094,6 @@ class CoveragePathPlanner:
             ]
         )
 
-        # 去重
         unique = []
 
         for a in angles:
@@ -1059,12 +2107,11 @@ class CoveragePathPlanner:
                 ) < math.radians(3.0)
                 for b in unique
             ):
+
                 unique.append(a)
 
-        # 最多保留几个
         if len(unique) > self.max_angle_candidates:
 
-            # 优先 PCA
             unique = sorted(
                 unique,
                 key=lambda a:
@@ -1189,7 +2236,6 @@ class CoveragePathPlanner:
                     len(coverage_segments) - 1
                 )
 
-                # 实际 heading change
                 turn_angle = self.coverage_turn_angle(
                     coverage_segments
                 )
@@ -1237,14 +2283,18 @@ class CoveragePathPlanner:
                     )
                 )
 
-        # 每个 cell 只保留最好的 K 个
         candidates.sort(
             key=lambda x: x.score
         )
 
+        top_k = max(
+            1,
+            int(self.candidate_top_k)
+        )
+
         return candidates[
             :min(
-                8,
+                top_k,
                 len(candidates)
             )
         ]
@@ -1260,21 +2310,6 @@ class CoveragePathPlanner:
         phase,
         spacing_cells
     ):
-        """
-        真正的 Boustrophedon / Zip-Zap 路径。
-
-        核心逻辑：
-
-            lane 0:  ---------------->
-            connector:              |
-            lane 1:  <----------------
-            connector:              |
-            lane 2:  ---------------->
-
-        注意：
-        这里不再把所有 pixel 按最近 lane 排序。
-        每一条 lane 都是真正的连续扫描段。
-        """
 
         pixels = np.argwhere(
             cell_mask
@@ -1286,16 +2321,6 @@ class CoveragePathPlanner:
         center = pixels.mean(
             axis=0
         )
-
-        # row/col 坐标
-        #
-        # sweep direction:
-        #     u = (sin(theta), cos(theta))
-        #
-        # normal:
-        #     v = (cos(theta), -sin(theta))
-        #
-        # 这样 theta=0 时，扫描方向为 col 正方向。
 
         st = math.sin(
             angle
@@ -1336,10 +2361,6 @@ class CoveragePathPlanner:
 
             return None
 
-        # ----------------------------------------------------
-        # Generate lane coordinates
-        # ----------------------------------------------------
-
         first_lane = (
             math.floor(
                 (
@@ -1367,10 +2388,6 @@ class CoveragePathPlanner:
 
             current += spacing_cells
 
-        # ----------------------------------------------------
-        # Extract scanline runs
-        # ----------------------------------------------------
-
         scan_segments = []
 
         for lane_index, lane_n in enumerate(lanes):
@@ -1386,16 +2403,11 @@ class CoveragePathPlanner:
             if len(selected) == 0:
                 continue
 
-            # 按扫描方向排序
             selected = selected[
                 np.argsort(
                     sweep[selected]
                 )
             ]
-
-            # ------------------------------------------------
-            # Split discontinuous runs
-            # ------------------------------------------------
 
             runs = []
 
@@ -1432,6 +2444,7 @@ class CoveragePathPlanner:
                 if distance > self.scan_gap_cells:
 
                     if len(current_run) > 0:
+
                         runs.append(
                             current_run
                         )
@@ -1451,15 +2464,9 @@ class CoveragePathPlanner:
                     current_run
                 )
 
-            # ------------------------------------------------
-            # Create segments
-            # ------------------------------------------------
-
             for run in runs:
 
                 if len(run) < 2:
-
-                    # 太短的单点不作为独立覆盖线
                     continue
 
                 points = [
@@ -1469,7 +2476,6 @@ class CoveragePathPlanner:
                     for i in run
                 ]
 
-                # 压缩成真正的 scanline 两端
                 start = points[0]
                 end = points[-1]
 
@@ -1487,20 +2493,12 @@ class CoveragePathPlanner:
         if not scan_segments:
             return None
 
-        # ----------------------------------------------------
-        # 排序
-        # ----------------------------------------------------
-
         scan_segments.sort(
             key=lambda x: (
                 x[0],
                 x[1][0] + x[1][1]
             )
         )
-
-        # ----------------------------------------------------
-        # 构造 Zip-Zap
-        # ----------------------------------------------------
 
         final_path = []
 
@@ -1514,10 +2512,6 @@ class CoveragePathPlanner:
             end
         ) in enumerate(scan_segments):
 
-            # ------------------------------------------------
-            # Alternate direction
-            # ------------------------------------------------
-
             if segment_index % 2 == 0:
 
                 seg_start = start
@@ -1528,10 +2522,6 @@ class CoveragePathPlanner:
                 seg_start = end
                 seg_end = start
 
-            # ------------------------------------------------
-            # Connector
-            # ------------------------------------------------
-
             if previous_end is not None:
 
                 connector = self.astar(
@@ -1541,7 +2531,6 @@ class CoveragePathPlanner:
                 )
 
                 if connector is None:
-
                     return None
 
                 if len(connector) > 1:
@@ -1564,17 +2553,11 @@ class CoveragePathPlanner:
                     seg_start
                 )
 
-            # ------------------------------------------------
-            # Coverage line
-            # ------------------------------------------------
-
             coverage = self.raster_line(
                 seg_start,
                 seg_end
             )
 
-            # 如果直线不完全在 cell 中，
-            # 用 A* 生成安全路径。
             if not self.path_is_free(
                 coverage,
                 cell_mask
@@ -1614,10 +2597,6 @@ class CoveragePathPlanner:
             )
 
             previous_end = seg_end
-
-        # ----------------------------------------------------
-        # Remove duplicates
-        # ----------------------------------------------------
 
         final_path = self.remove_consecutive_duplicates(
             final_path
@@ -1703,17 +2682,19 @@ class CoveragePathPlanner:
         return result
 
     # ========================================================
-    # A*
+    # Weighted A*
     # ========================================================
 
     def astar(
         self,
         start,
         goal,
-        free_map
+        free_map,
+        cost_map=None
     ):
 
         if start == goal:
+
             return [
                 start
             ]
@@ -1740,18 +2721,37 @@ class CoveragePathPlanner:
         if not free_map[gr, gc]:
             return None
 
+        if cost_map is None:
+
+            cost_map_key = None
+
+        else:
+
+            if cost_map.shape != free_map.shape:
+
+                raise ValueError(
+                    "cost_map shape mismatch"
+                )
+
+            cost_map_key = id(
+                cost_map
+            )
+
         cache_key = (
             id(free_map),
+            cost_map_key,
             start,
             goal
         )
 
-        if cache_key in self.astar_cache:
+        cached = self.astar_cache.get(
+            cache_key
+        )
+
+        if cached is not None:
 
             return list(
-                self.astar_cache[
-                    cache_key
-                ]
+                cached
             )
 
         open_heap = []
@@ -1780,7 +2780,7 @@ class CoveragePathPlanner:
 
         if self.astar_diagonal:
 
-            directions = [
+            directions = (
                 (-1, 0, 1.0),
                 (1, 0, 1.0),
                 (0, -1, 1.0),
@@ -1789,16 +2789,19 @@ class CoveragePathPlanner:
                 (-1, 1, math.sqrt(2)),
                 (1, -1, math.sqrt(2)),
                 (1, 1, math.sqrt(2))
-            ]
+            )
 
         else:
 
-            directions = [
+            directions = (
                 (-1, 0, 1.0),
                 (1, 0, 1.0),
                 (0, -1, 1.0),
                 (0, 1, 1.0)
-            ]
+            )
+
+        heuristic = self.heuristic
+        reconstruct_path = self.reconstruct_path
 
         while open_heap:
 
@@ -1811,7 +2814,7 @@ class CoveragePathPlanner:
 
             if current == goal:
 
-                path = self.reconstruct_path(
+                path = reconstruct_path(
                     parent,
                     current
                 )
@@ -1843,7 +2846,6 @@ class CoveragePathPlanner:
                 if not free_map[nr, nc]:
                     continue
 
-                # 禁止 diagonal corner cutting
                 if dr != 0 and dc != 0:
 
                     if not (
@@ -1861,10 +2863,24 @@ class CoveragePathPlanner:
                 if neighbor in closed:
                     continue
 
+                if cost_map is None:
+
+                    terrain_cost = 1.0
+
+                else:
+
+                    terrain_cost = max(
+                        1.0,
+                        float(
+                            cost_map[nr, nc]
+                        )
+                    )
+
                 tentative_g = (
                     g_cost[current]
                     +
-                    move_cost
+                    move_cost *
+                    terrain_cost
                 )
 
                 old_g = g_cost.get(
@@ -1883,7 +2899,7 @@ class CoveragePathPlanner:
                     f = (
                         tentative_g
                         +
-                        self.heuristic(
+                        heuristic(
                             neighbor,
                             goal
                         )
@@ -1900,6 +2916,10 @@ class CoveragePathPlanner:
 
         return None
 
+    # ========================================================
+    # Heuristic
+    # ========================================================
+
     @staticmethod
     def heuristic(
         a,
@@ -1913,6 +2933,10 @@ class CoveragePathPlanner:
             dr,
             dc
         )
+
+    # ========================================================
+    # Reconstruct path
+    # ========================================================
 
     @staticmethod
     def reconstruct_path(
@@ -2032,16 +3056,13 @@ class CoveragePathPlanner:
         ordered_cells,
         all_candidates,
         free_map,
+        cost_map,
         start_grid,
         resolution
     ):
 
         if not ordered_cells:
             return []
-
-        # ----------------------------------------------------
-        # Dynamic programming over candidate states
-        # ----------------------------------------------------
 
         dp = {}
         parent = {}
@@ -2057,7 +3078,8 @@ class CoveragePathPlanner:
             connector = self.astar(
                 start_grid,
                 candidate.entry,
-                free_map
+                free_map,
+                cost_map
             )
 
             if connector is None:
@@ -2065,7 +3087,8 @@ class CoveragePathPlanner:
 
             connector_time = self.path_time(
                 connector,
-                resolution
+                resolution,
+                cost_map
             )
 
             total = (
@@ -2083,10 +3106,6 @@ class CoveragePathPlanner:
 
         if not dp:
             return None
-
-        # ----------------------------------------------------
-        # Remaining cells
-        # ----------------------------------------------------
 
         for cell_index in range(
             1,
@@ -2136,7 +3155,8 @@ class CoveragePathPlanner:
                     connector = self.astar(
                         prev_candidate.exit,
                         current_candidate.entry,
-                        free_map
+                        free_map,
+                        cost_map
                     )
 
                     if connector is None:
@@ -2144,7 +3164,8 @@ class CoveragePathPlanner:
 
                     connector_time = self.path_time(
                         connector,
-                        resolution
+                        resolution,
+                        cost_map
                     )
 
                     cost = (
@@ -2180,10 +3201,6 @@ class CoveragePathPlanner:
 
             if not dp:
                 return None
-
-        # ----------------------------------------------------
-        # Backtrack
-        # ----------------------------------------------------
 
         final_key = min(
             dp,
@@ -2234,7 +3251,8 @@ class CoveragePathPlanner:
         self,
         start_grid,
         selected,
-        free_map
+        free_map,
+        cost_map
     ):
 
         if not selected:
@@ -2248,14 +3266,11 @@ class CoveragePathPlanner:
             selected
         ):
 
-            # ------------------------------------------------
-            # Connector / start connection
-            # ------------------------------------------------
-
             connector = self.astar(
                 previous,
                 candidate.entry,
-                free_map
+                free_map,
+                cost_map
             )
 
             if connector is None:
@@ -2286,12 +3301,6 @@ class CoveragePathPlanner:
                         segment_type=segment_type
                     )
                 )
-
-            # ------------------------------------------------
-            # COVERAGE
-            #
-            # 这里绝对不能 shortcut。
-            # ------------------------------------------------
 
             coverage = self.remove_consecutive_duplicates(
                 candidate.path
@@ -2537,7 +3546,6 @@ class CoveragePathPlanner:
 
             marker.scale.z = 0.02
 
-            # 不指定固定颜色
             marker.color.a = 0.25
 
             for row, col in cell.pixels:
@@ -2547,8 +3555,6 @@ class CoveragePathPlanner:
                     col,
                     map_msg
                 )
-
-                from geometry_msgs.msg import Point
 
                 p = Point()
 
@@ -2599,19 +3605,21 @@ class CoveragePathPlanner:
             flattened
         )
 
+        step = max(
+            1,
+            int(
+                0.5 /
+                max(
+                    resolution,
+                    1e-6
+                )
+            )
+        )
+
         for i in range(
             0,
             len(flattened) - 1,
-            max(
-                1,
-                int(
-                    0.5 /
-                    max(
-                        resolution,
-                        1e-6
-                    )
-                )
-            )
+            step
         ):
 
             r1, c1 = flattened[i]
@@ -2652,14 +3660,14 @@ class CoveragePathPlanner:
 
             marker.points = []
 
-            from geometry_msgs.msg import Point
-
             p1 = Point()
+
             p1.x = x1
             p1.y = y1
             p1.z = 0.05
 
             p2 = Point()
+
             p2.x = x2
             p2.y = y2
             p2.z = 0.05
@@ -2691,30 +3699,82 @@ class CoveragePathPlanner:
     def path_time(
         self,
         path,
-        resolution
+        resolution,
+        cost_map=None
     ):
 
         if len(path) < 2:
             return 0.0
 
-        distance_cells = (
-            self.path_length_grid(
-                path
-            )
-        )
+        weighted_distance_m = 0.0
 
-        distance_m = (
-            distance_cells *
+        resolution = float(
             resolution
         )
 
-        return (
-            distance_m /
-            max(
-                self.robot_linear_speed,
-                1e-6
-            )
+        linear_speed = max(
+            self.robot_linear_speed,
+            1e-6
         )
+
+        if cost_map is None:
+
+            for i in range(
+                len(path) - 1
+            ):
+
+                r1, c1 = path[i]
+                r2, c2 = path[i + 1]
+
+                move_cells = math.hypot(
+                    r2 - r1,
+                    c2 - c1
+                )
+
+                weighted_distance_m += (
+                    move_cells *
+                    resolution
+                )
+
+        else:
+
+            for i in range(
+                len(path) - 1
+            ):
+
+                r1, c1 = path[i]
+                r2, c2 = path[i + 1]
+
+                move_cells = math.hypot(
+                    r2 - r1,
+                    c2 - c1
+                )
+
+                move_m = (
+                    move_cells *
+                    resolution
+                )
+
+                terrain_cost = max(
+                    1.0,
+                    float(
+                        cost_map[r2, c2]
+                    )
+                )
+
+                weighted_distance_m += (
+                    move_m *
+                    terrain_cost
+                )
+
+        return (
+            weighted_distance_m /
+            linear_speed
+        )
+
+    # ========================================================
+    # Path length
+    # ========================================================
 
     @staticmethod
     def path_length_grid(

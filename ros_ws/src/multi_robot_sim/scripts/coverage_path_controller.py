@@ -13,7 +13,7 @@ Global BCD Coverage Path + Improved DWA Local Planner
 2. 使用整个预测轨迹计算 Path Error
 3. 使用 Path Heading
 4. 使用 Path Progress
-5. 增加原地旋转 Recovery
+5. 增加障碍绕行 Recovery
 6. no safe trajectory 不再永久 STOP
 7. DWA 支持 0 m/s + 非零角速度
 8. 静态障碍物与其他机器人分别处理
@@ -68,17 +68,17 @@ class RobotPathTracker:
 
         self.max_linear_speed = rospy.get_param(
             "~max_linear_speed",
-            0.20
+            1.0
         )
 
         self.min_linear_speed = rospy.get_param(
             "~min_linear_speed",
-            0.00
+            1.0
         )
 
         self.max_angular_speed = rospy.get_param(
             "~max_angular_speed",
-            1.2
+            1.5
         )
 
         # ============================================================
@@ -87,7 +87,7 @@ class RobotPathTracker:
 
         self.max_linear_accel = rospy.get_param(
             "~max_linear_accel",
-            1.5
+            4.0
         )
 
         self.max_angular_accel = rospy.get_param(
@@ -106,7 +106,7 @@ class RobotPathTracker:
 
         self.dwa_predict_time = rospy.get_param(
             "~dwa_predict_time",
-            1.5
+            1.2
         )
 
         self.linear_samples = rospy.get_param(
@@ -249,12 +249,44 @@ class RobotPathTracker:
 
         self.recovery_timeout = rospy.get_param(
             "~recovery_timeout",
-            3.0
+            6.0
         )
 
-        self.recovery_min_rotation = rospy.get_param(
-            "~recovery_min_rotation",
-            0.15
+        # Recovery is now a real obstacle-bypass state machine:
+        # ROTATE -> DRIVE -> DWA REJOIN.
+        self.recovery_forward_speed = rospy.get_param(
+            "~recovery_forward_speed",
+            0.25
+        )
+
+        self.recovery_turn_angle_deg = rospy.get_param(
+            "~recovery_turn_angle_deg",
+            70.0
+        )
+
+        self.recovery_drive_time = rospy.get_param(
+            "~recovery_drive_time",
+            0.8
+        )
+
+        self.recovery_clearance_threshold = rospy.get_param(
+            "~recovery_clearance_threshold",
+            0.55
+        )
+
+        self.recovery_front_blocked_distance = rospy.get_param(
+            "~recovery_front_blocked_distance",
+            0.45
+        )
+
+        self.recovery_heading_tolerance = rospy.get_param(
+            "~recovery_heading_tolerance",
+            0.12
+        )
+
+        self.recovery_max_attempts = rospy.get_param(
+            "~recovery_max_attempts",
+            2
         )
 
         # ============================================================
@@ -309,6 +341,11 @@ class RobotPathTracker:
         self.recovery_start_time = None
         self.recovery_direction = 1.0
         self.recovery_start_yaw = None
+        self.recovery_escape_heading = None
+        self.recovery_phase = "ROTATE"
+        self.recovery_drive_start_time = None
+        self.recovery_attempt = 0
+        self.recovery_total_start_time = None
 
         # ============================================================
         # Publisher
@@ -1920,6 +1957,140 @@ class RobotPathTracker:
         )
 
     # =================================================================
+    # Laser sector utilities for obstacle bypass
+    # =================================================================
+
+    def get_sector_clearance(
+        self,
+        angle_min_deg,
+        angle_max_deg
+    ):
+        """
+        Return a robust local clearance estimate from LaserScan.
+
+        The 25th percentile is used instead of the minimum so that one
+        isolated noisy laser return does not force the robot to choose
+        the wrong bypass side.
+        """
+
+        if self.scan_msg is None:
+
+            return 0.0
+
+        values = []
+
+        angle = self.scan_msg.angle_min
+
+        for distance in self.scan_msg.ranges:
+
+            if (
+                not math.isfinite(distance)
+                or
+                distance < self.scan_msg.range_min
+                or
+                distance > self.scan_msg.range_max
+            ):
+
+                angle += self.scan_msg.angle_increment
+                continue
+
+            angle_deg = math.degrees(
+                self.normalize_angle(angle)
+            )
+
+            if (
+                angle_min_deg <= angle_deg <= angle_max_deg
+            ):
+
+                values.append(distance)
+
+            angle += self.scan_msg.angle_increment
+
+        if not values:
+
+            return 0.0
+
+        return float(
+            np.percentile(
+                np.asarray(values),
+                25.0
+            )
+        )
+
+    # =================================================================
+    # Front clearance
+    # =================================================================
+
+    def get_front_clearance(self):
+
+        return self.get_sector_clearance(
+            -30.0,
+            30.0
+        )
+
+    # =================================================================
+    # Choose bypass direction
+    # =================================================================
+
+    def choose_recovery_direction(self):
+        """
+        Choose the side with more free space.
+
+        +1.0 = left / CCW
+        -1.0 = right / CW
+        """
+
+        left_clearance = self.get_sector_clearance(
+            30.0,
+            110.0
+        )
+
+        right_clearance = self.get_sector_clearance(
+            -110.0,
+            -30.0
+        )
+
+        if left_clearance <= 0.0 and right_clearance <= 0.0:
+
+            return 1.0
+
+        if left_clearance >= right_clearance:
+
+            direction = 1.0
+
+        else:
+
+            direction = -1.0
+
+        rospy.logwarn(
+            "Robot%d bypass direction: %s "
+            "(left %.2fm, right %.2fm)",
+            self.robot_id,
+            "LEFT" if direction > 0.0 else "RIGHT",
+            left_clearance,
+            right_clearance
+        )
+
+        return direction
+
+    # =================================================================
+    # Set recovery escape heading
+    # =================================================================
+
+    def set_recovery_escape_heading(
+        self,
+        angle_deg
+    ):
+
+        self.recovery_escape_heading = self.normalize_angle(
+            self.robot_yaw
+            +
+            self.recovery_direction
+            *
+            math.radians(angle_deg)
+        )
+
+    # =================================================================
     # Start recovery
     # =================================================================
 
@@ -1929,52 +2100,46 @@ class RobotPathTracker:
 
             return
 
+        if self.robot_yaw is None:
+
+            return
+
         self.recovery_mode = True
 
-        self.recovery_start_time = (
-            rospy.Time.now()
-        )
+        now = rospy.Time.now()
 
-        self.recovery_start_yaw = (
-            self.robot_yaw
-        )
+        self.recovery_start_time = now
+        self.recovery_total_start_time = now
+        self.recovery_start_yaw = self.robot_yaw
+        self.recovery_attempt = 0
+        self.recovery_phase = "ROTATE"
+        self.recovery_drive_start_time = None
 
         # ------------------------------------------------------------
-        # 根据 path heading 决定旋转方向
+        # IMPORTANT:
+        #
+        # The old controller chose the rotation direction from the
+        # global path heading. That is exactly why it rotated back toward
+        # a blocked obstacle and repeatedly entered/exited recovery.
+        #
+        # Here we choose the side with more LaserScan clearance instead.
         # ------------------------------------------------------------
 
-        target_index = (
-            self.update_target_index()
+        self.recovery_direction = (
+            self.choose_recovery_direction()
         )
 
-        if target_index is not None:
-
-            path_yaw = (
-                self.get_path_heading(
-                    target_index
-                )
-            )
-
-            yaw_error = self.normalize_angle(
-                path_yaw -
-                self.robot_yaw
-            )
-
-            if yaw_error >= 0.0:
-
-                self.recovery_direction = 1.0
-
-            else:
-
-                self.recovery_direction = -1.0
-
-        else:
-
-            self.recovery_direction = 1.0
+        self.set_recovery_escape_heading(
+            self.recovery_turn_angle_deg
+        )
 
         rospy.logwarn(
-            "Robot%d entering rotation recovery.",
-            self.robot_id
+            "Robot%d entering OBSTACLE BYPASS recovery "
+            "phase=ROTATE, escape_heading=%.1f deg.",
+            self.robot_id,
+            math.degrees(
+                self.recovery_escape_heading
+            )
         )
 
     # =================================================================
@@ -1982,105 +2147,316 @@ class RobotPathTracker:
     # =================================================================
 
     def recovery_control(self):
+        """
+        Obstacle bypass state machine.
+
+        ROTATE:
+            Turn toward a temporary heading that points around the
+            obstacle.
+
+        DRIVE:
+            Move slowly while maintaining that temporary heading.
+            If the front becomes blocked again, rotate another 45 deg.
+
+        REJOIN:
+            Stop recovery only when a normal DWA trajectory is available.
+        """
 
         if not self.recovery_mode:
 
             return False
 
+        now = rospy.Time.now()
+
         elapsed = (
-            rospy.Time.now()
-            -
-            self.recovery_start_time
+            now - self.recovery_total_start_time
         ).to_sec()
 
         # ------------------------------------------------------------
-        # Timeout
+        # Global recovery timeout
         # ------------------------------------------------------------
 
         if elapsed >= self.recovery_timeout:
 
-            rospy.logwarn(
-                "Robot%d recovery timeout.",
-                self.robot_id
+            if self.recovery_attempt < self.recovery_max_attempts:
+
+                self.recovery_attempt += 1
+
+                self.recovery_direction *= -1.0
+                self.recovery_phase = "ROTATE"
+                self.recovery_start_time = now
+                self.recovery_drive_start_time = None
+
+                self.set_recovery_escape_heading(
+                    self.recovery_turn_angle_deg
+                )
+
+                rospy.logwarn(
+                    "Robot%d recovery timeout. "
+                    "Switching bypass side to %s "
+                    "(attempt %d/%d).",
+                    self.robot_id,
+                    "LEFT"
+                    if self.recovery_direction > 0.0
+                    else "RIGHT",
+                    self.recovery_attempt,
+                    self.recovery_max_attempts
+                )
+
+                return True
+
+            rospy.logerr(
+                "Robot%d cannot bypass obstacle after %d attempts. "
+                "Stopping temporarily.",
+                self.robot_id,
+                self.recovery_max_attempts
             )
 
             self.recovery_mode = False
-
-            return False
-
-        # ------------------------------------------------------------
-        # 当前 path heading
-        # ------------------------------------------------------------
-
-        target_index = (
-            self.update_target_index()
-        )
-
-        if target_index is None:
-
             self.stop()
 
             return True
 
-        path_yaw = (
-            self.get_path_heading(
-                target_index
-            )
-        )
+        if self.recovery_escape_heading is None:
 
-        yaw_error = self.normalize_angle(
-            path_yaw -
+            self.set_recovery_escape_heading(
+                self.recovery_turn_angle_deg
+            )
+
+        front_clearance = self.get_front_clearance()
+
+        # ============================================================
+        # ROTATE phase
+        # ============================================================
+
+        if self.recovery_phase == "ROTATE":
+
+            heading_error = self.normalize_angle(
+                self.recovery_escape_heading
+                -
+                self.robot_yaw
+            )
+
+            # If the front is extremely close to an obstacle, keep
+            # rotating; do not switch to forward motion.
+            if (
+                abs(heading_error)
+                <=
+                self.recovery_heading_tolerance
+                and
+                front_clearance
+                >=
+                self.recovery_front_blocked_distance
+            ):
+
+                self.recovery_phase = "DRIVE"
+                self.recovery_drive_start_time = now
+
+                rospy.loginfo(
+                    "Robot%d bypass ROTATE complete. "
+                    "Starting slow DRIVE. front=%.2fm",
+                    self.robot_id,
+                    front_clearance
+                )
+
+            else:
+
+                angular = (
+                    self.recovery_rotate_speed
+                    if heading_error > 0.0
+                    else
+                    -self.recovery_rotate_speed
+                )
+
+                # If front is blocked even after reaching the temporary
+                # heading, make another side turn instead of exiting.
+                if (
+                    abs(heading_error)
+                    <=
+                    self.recovery_heading_tolerance
+                    and
+                    front_clearance
+                    <
+                    self.recovery_front_blocked_distance
+                ):
+
+                    self.recovery_escape_heading = self.normalize_angle(
+                        self.robot_yaw
+                        +
+                        self.recovery_direction
+                        *
+                        math.radians(45.0)
+                    )
+
+                    angular = (
+                        self.recovery_rotate_speed
+                        *
+                        self.recovery_direction
+                    )
+
+                cmd = Twist()
+                cmd.linear.x = 0.0
+                cmd.angular.z = max(
+                    -self.max_angular_speed,
+                    min(
+                        self.max_angular_speed,
+                        angular
+                    )
+                )
+
+                self.cmd_pub.publish(cmd)
+
+                return True
+
+        # ============================================================
+        # DRIVE phase
+        # ============================================================
+
+        if self.recovery_phase == "DRIVE":
+
+            # If an obstacle is still directly in front, stop translation
+            # and turn farther around it.
+            if (
+                front_clearance
+                <
+                self.recovery_front_blocked_distance
+            ):
+
+                self.recovery_phase = "ROTATE"
+                self.recovery_escape_heading = self.normalize_angle(
+                    self.robot_yaw
+                    +
+                    self.recovery_direction
+                    *
+                    math.radians(45.0)
+                )
+
+                rospy.logwarn(
+                    "Robot%d bypass front blocked again "
+                    "(%.2fm). Turning another 45 deg.",
+                    self.robot_id,
+                    front_clearance
+                )
+
+                return True
+
+            heading_error = self.normalize_angle(
+                self.recovery_escape_heading
+                -
+                self.robot_yaw
+            )
+
+            # Small heading correction while translating.
+            angular = max(
+                -self.max_angular_speed,
+                min(
+                    self.max_angular_speed,
+                    1.5 * heading_error
+                )
+            )
+
+            speed = self.recovery_forward_speed
+
+            # Slow down further when the front clearance is marginal.
+            if front_clearance < 0.80:
+
+                scale = (
+                    front_clearance
+                    -
+                    self.recovery_front_blocked_distance
+                ) / (
+                    0.80
+                    -
+                    self.recovery_front_blocked_distance
+                )
+
+                scale = max(
+                    0.25,
+                    min(1.0, scale)
+                )
+
+                speed *= scale
+
+            cmd = Twist()
+            cmd.linear.x = max(
+                0.0,
+                min(
+                    self.recovery_forward_speed,
+                    speed
+                )
+            )
+            cmd.angular.z = angular
+
+            self.cmd_pub.publish(cmd)
+
+            drive_elapsed = (
+                now
+                -
+                self.recovery_drive_start_time
+            ).to_sec()
+
+            # --------------------------------------------------------
+            # After moving sideways/forward for a short distance,
+            # ask DWA whether normal path tracking is possible again.
+            # --------------------------------------------------------
+
+            if drive_elapsed >= self.recovery_drive_time:
+
+                (
+                    test_v,
+                    test_w,
+                    test_score
+                ) = self.dwa_control()
+
+                if (
+                    test_v is not None
+                    and
+                    test_v > 0.02
+                ):
+
+                    self.recovery_mode = False
+                    self.recovery_escape_heading = None
+
+                    rospy.loginfo(
+                        "Robot%d obstacle bypass complete. "
+                        "Returning to DWA (v=%.2f, w=%.2f).",
+                        self.robot_id,
+                        test_v,
+                        test_w
+                    )
+
+                    return False
+
+                # DWA is still blocked. Continue bypassing rather than
+                # immediately entering the old rotation loop.
+                self.recovery_phase = "ROTATE"
+                self.recovery_escape_heading = self.normalize_angle(
+                    self.robot_yaw
+                    +
+                    self.recovery_direction
+                    *
+                    math.radians(35.0)
+                )
+
+                rospy.logwarn(
+                    "Robot%d DWA still blocked after bypass segment. "
+                    "Continuing around obstacle.",
+                    self.robot_id
+                )
+
+            return True
+
+        # ------------------------------------------------------------
+        # Safety fallback
+        # ------------------------------------------------------------
+
+        self.recovery_phase = "ROTATE"
+        self.recovery_escape_heading = self.normalize_angle(
             self.robot_yaw
-        )
-
-        # ------------------------------------------------------------
-        # 如果已经基本朝向 path
-        # ------------------------------------------------------------
-
-        if abs(yaw_error) < 0.20:
-
-            self.recovery_mode = False
-
-            rospy.loginfo(
-                "Robot%d recovery finished.",
-                self.robot_id
-            )
-
-            return False
-
-        # ------------------------------------------------------------
-        # 旋转
-        # ------------------------------------------------------------
-
-        angular = (
+            +
             self.recovery_direction
             *
-            self.recovery_rotate_speed
-        )
-
-        # ------------------------------------------------------------
-        # 如果方向判断发生变化
-        # ------------------------------------------------------------
-
-        if yaw_error > 0.0:
-
-            angular = (
-                self.recovery_rotate_speed
-            )
-
-        else:
-
-            angular = (
-                -self.recovery_rotate_speed
-            )
-
-        cmd = Twist()
-
-        cmd.linear.x = 0.0
-        cmd.angular.z = angular
-
-        self.cmd_pub.publish(
-            cmd
+            math.radians(45.0)
         )
 
         return True
@@ -2209,7 +2585,13 @@ class RobotPathTracker:
 
             self.start_recovery()
 
-            self.recovery_control()
+            if self.recovery_mode:
+
+                self.recovery_control()
+
+            else:
+
+                self.stop()
 
             return
 
@@ -2282,6 +2664,45 @@ class RobotPathTracker:
             )
 
             linear_x *= factor
+
+        # ============================================================
+        # Local obstacle speed limiting
+        # ============================================================
+
+        # Do not wait until the trajectory is inside collision distance.
+        # Gradually reduce speed when the front clearance becomes small.
+        front_clearance = self.get_front_clearance()
+
+        if front_clearance > 0.0 and front_clearance < 1.0:
+
+            collision_distance = (
+                self.robot_radius
+                +
+                self.obstacle_margin
+            )
+
+            if front_clearance <= collision_distance:
+
+                linear_x = 0.0
+
+            else:
+
+                speed_scale = (
+                    front_clearance
+                    -
+                    collision_distance
+                ) / (
+                    1.0
+                    -
+                    collision_distance
+                )
+
+                speed_scale = max(
+                    0.20,
+                    min(1.0, speed_scale)
+                )
+
+                linear_x *= speed_scale
 
         # ============================================================
         # Publish

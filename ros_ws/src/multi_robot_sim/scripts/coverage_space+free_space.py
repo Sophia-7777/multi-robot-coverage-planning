@@ -60,7 +60,7 @@ class CoverageTracker:
 
         self.coverage_margin = rospy.get_param(
             "~coverage_margin",
-            0.2
+            0.5
         )
 
         self.coverage_radius = (

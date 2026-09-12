@@ -39,12 +39,12 @@ class MultiRobotKeyboard:
 
         self.linear_speed = rospy.get_param(
             "~linear_speed",
-            0.20
+            4.0
         )
 
         self.angular_speed = rospy.get_param(
             "~angular_speed",
-            0.80
+            10.0
         )
 
         # ============================================================
